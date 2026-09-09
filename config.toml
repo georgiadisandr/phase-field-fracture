@@ -1,0 +1,345 @@
+# =============================================================================
+# Phase-field fracture run configuration (quasi-static).
+#
+# load_factor ramps 0 -> 1 in [run].N_steps equal increments. Each increment
+# is solved to Newton equilibrium; the crack-driving history field is raised
+# after every converged step so the crack cannot heal.
+#
+# Units: lengths in mm, stresses in MPa, Gc in N/mm.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Mesh / specimen geometry
+#
+# source selects where the mesh comes from:
+#
+#   "builtin"  (default) MeshGeneration.cpp builds the parametric SENT
+#              specimen from W, H, a and y_crack below.
+#
+#   "file"     an external gmsh file is opened instead and EVERY geometry and
+#              mesh-size key below is ignored. Any format gmsh reads works
+#              (.msh, .geo, .step, .brep). A .msh is used exactly as saved; a
+#              .geo or CAD file is meshed on load using the options the file
+#              itself sets.
+#
+# Setting `path` without `source` implies "file".
+#
+# The solver never sees the geometry -- it resolves everything by physical
+# group NAME -- so an external mesh only has to satisfy that contract:
+#
+#   * 2D, in the z = 0 plane, lengths in mm
+#   * a 2D physical group matching [[material_for_group]] (e.g. "Domain")
+#   * 1D named groups for every edge used by [[bcs]] / [[neumann]], and 0D
+#     groups for [[point_load]] / [[initial_phi]] points
+#   * element order 1: tri3, quad4 and quad8 are supported
+#   * crack faces made of DUPLICATED, unmerged nodes -- gmsh's Plugin(Crack)
+#     is the reliable way to get these
+#
+# Check a file against that contract without solving:
+#     phasefield_1 config.toml --mesh-file meshes/spec.msh --mesh-only
+# It runs the whole pre-processing path, so a missing or misnamed group fails
+# in seconds with the offending name. Watch nvfix in the printed summary:
+# nvfix = 0 means the Dirichlet groups matched no nodes.
+#
+#   source = "file"
+#   path   = "meshes/three_point_bend.msh"
+# -----------------------------------------------------------------------------
+[mesh]
+source    = "builtin"
+W         = 1.0
+H         = 1.0
+a         = 0.5
+# y_crack defaults to H/2 when omitted.
+
+# h_fine - h_far mesh size near and far the selected physical group 
+h_fine    = 2e-3
+h_far     = 6.0e-2
+
+# distance of mesh refinment 
+r_fine    = 0.5
+r_far     = 0.7
+
+base_name = "SENT_fine_stress_hybrid_2stagger"
+
+# -----------------------------------------------------------------------------
+# FEM problem-level constants
+# -----------------------------------------------------------------------------
+[fem]
+ntype = 1     # 1 = plane stress, 2 = plane strain
+ndofn = 2     # deggres of freedom dispacement field only
+ngaus = 2     # Gauss point per direction   
+nstre = 3
+
+# Strain-energy split -- which part of the elastic energy the phase field is
+# allowed to degrade. The phase field is driven by the "positive" energy psi+:
+#
+#   "none"      psi+ = full energy. The whole stress is degraded by g(phi).
+#   "lancioni"  psi+ = deviatoric energy only (Lancioni & Royer-Carfagni).
+#               The volumetric energy is never degraded, in tension OR
+#               compression.
+#   "amor"      psi+ = deviatoric + tensile-volumetric energy (Amor, Marigo,
+#               Maurini). Only compressive volumetric energy is protected.
+#   "spectral"  psi+ from the positive eigen-strains of eps (Miehe et al.).
+#               The most faithful tension/compression split.
+#
+# Default is "amor" when omitted.
+energy_split = "spectral"
+
+# Hybrid formulation (Ambati, Gerasimov & De Lorenzis, Comput Mech 55:383-405,
+# 2015).
+#
+# This is ORTHOGONAL to energy_split above: it does not select a split, it
+# selects WHICH EQUATION sees the split.
+#
+#   false  fully anisotropic model. Both the momentum balance and the phase-
+#          field equation use the split. sigma = g(phi) sigma+ + sigma-, which
+#          is NON-LINEAR in u, so the u-sub-solve needs a real Newton loop and
+#          (for "spectral") a finite-differenced tangent.
+#
+#   true   hybrid. The momentum balance reverts to the isotropic form
+#              sigma = g(phi) * C * eps,
+#          which is LINEAR in u for frozen phi -- the u-sub-solve becomes a
+#          single exact linear solve. The phase field is STILL driven by psi+
+#          from energy_split, so the tension/compression asymmetry is retained
+#          where it matters. Ambati report ~1 order of magnitude speed-up.
+#
+#          For "spectral" this also removes the finite-differenced tangent
+#          entirely (C+ = C, cached), so that whole approximation disappears.
+#
+# Caveats:
+#   * The hybrid model is variationally inconsistent by construction -- the
+#     sigma / psi+ pair is not a potential-derivative pair. This is accepted
+#     and documented in the source paper.
+#   * Ambati additionally enforce phi = 0 where psi+ < psi-, to stop crack
+#     faces interpenetrating in compression. That constraint is NOT
+#     implemented here. For tension-dominated tests (this SENT specimen) it
+#     makes no difference; for problems with significant crack-face contact
+#     it does.
+#   * computeEnergy switches to the isotropic energy g(phi)*psi_total when
+#     this is true, because that is the functional the u-sub-step actually
+#     minimises -- the energy-gamma stopping criterion depends on it.
+#
+# Default is false when omitted.
+hybrid = true
+
+# -----------------------------------------------------------------------------
+# Material library.
+#
+# props is an ordered list { E, nu, Gc, l0, k }:
+#     E  -- Young's modulus           (MPa)
+#     nu -- Poisson's ratio           (-)
+#     Gc -- critical energy release   (N/mm)
+#     l0 -- phase-field length scale  (mm)
+#     k  -- residual stiffness factor (-)
+# -----------------------------------------------------------------------------
+[[materials]]
+name  = "test"
+props = [ 20800.0, 0.3, 2.7, 4.0e-3, 1e-9 ]
+
+[[material_for_group]]
+group    = "Domain"
+material = "test"
+
+# -----------------------------------------------------------------------------
+# Dirichlet boundary conditions
+# -----------------------------------------------------------------------------
+[[bcs]]
+physical_name = "Bottom"
+flags         = [1, 1]
+values        = [0.0, 0.0]
+
+[[bcs]]
+physical_name = "Top"
+flags         = [1, 1]
+values        = [0.0, 0.0]    # applied uy in mm at full load
+
+[[bcs]]
+physical_name = "Right"
+flags         = [1, 1]
+values        = [0.03, 0.0]
+
+
+# -----------------------------------------------------------------------------
+# Neumann boundary conditions (surface tractions). OPTIONAL.
+#
+#   physical_name -- gmsh physical-group name (1D)
+#   traction      -- length-ndofn force per unit edge length [tx, ty] in N/mm.
+#                    Multiplied by load_factor each step.
+# -----------------------------------------------------------------------------
+# [[neumann]]
+# physical_name = "Top"
+# traction      = [0.0, 0.4]
+
+# -----------------------------------------------------------------------------
+# Concentrated nodal point loads. OPTIONAL.
+#
+# Each [[point_load]] entry applies a Cartesian force directly at the node(s)
+# of a 0D (point) physical group -- no integration, the force IS the nodal
+# load. Like the tractions above, it is scaled by load_factor each step.
+#
+#   physical_name -- gmsh physical-group name of dimension 0 (a point)
+#   force         -- length-ndofn force vector [Fx, Fy] in N
+#
+# Example: pull straight up on the crack tip with 100 N at full load.
+# (The 0D group "CrackTip" is defined in MeshGeneration.cpp.)
+# -----------------------------------------------------------------------------
+# [[point_load]]
+# physical_name = "CrackTip"
+# force         = [0.0, 100.0]
+
+# -----------------------------------------------------------------------------
+# Initial phase-field overrides. OPTIONAL.
+#
+# Each [[initial_phi]] entry sets phi = value on every mesh node of a physical
+# group at step 0. The physical group can be 0D, 1D or 2D -- the GMSH reader
+# tries dimensions in increasing order and uses the first match.
+#
+# This only sets the INITIAL state. The solver then evolves phi freely; nothing
+# is pinned. If you set phi = 1 on a strip with no surrounding history, the
+# phi-residual will try to relax it back unless the elastic energy in the
+# region builds H fast enough to hold it. For a permanently-locked pre-crack
+# you'd want either Dirichlet-pinning on phi or history-field seeding (not yet
+# implemented).
+#
+#   physical_name -- name of any gmsh physical group
+#   value         -- scalar phi to apply (typically 1.0 for "fully damaged")
+#
+# Example: pre-damage a physical group called "InitialCrack" to phi = 1.
+# -----------------------------------------------------------------------------
+# [[initial_phi]]
+# physical_name = "InitialCrack"
+# value         = 1.0
+
+# -----------------------------------------------------------------------------
+# Newton solver.
+#
+#   tol_rel, tol_abs -- a (sub-)solve converges when
+#                       ||R|| < max(tol_abs, tol_rel * ||R0||)
+#   max_iter         -- max Newton iterations per (sub-)solve
+#
+#   scheme           -- coupling strategy for the [u | phi] system:
+#                         "monolithic" (default) solves u and phi together;
+#                                      fast near the solution but the tangent
+#                                      can be indefinite during crack growth,
+#                                      where Newton may diverge.
+#                         "staggered"  alternate minimisation -- each step
+#                                      repeatedly solves the u sub-problem
+#                                      with phi frozen, then the phi sub-
+#                                      problem with u frozen, until the full
+#                                      coupled residual is small. More robust
+#                                      during crack propagation.
+#   max_staggered    -- (staggered only) max outer u/phi sweeps per step.
+# -----------------------------------------------------------------------------
+[solver]
+tol_rel       = 1.0e-6
+tol_abs       = 1.0e-8
+max_iter      = 100
+verbose       = true
+scheme        = "staggered"   # "monolithic" or "staggered"
+max_staggered = 2      # used only when scheme = "staggered"
+
+# Outer staggered-cycle stopping criterion (staggered only):
+#   "residual" -- stop when the coupled ||R|| < max(tol_abs, tol_rel*||R0||).
+#                 Drives the staggered fixed point to the monolithic solution.
+#   "energy"   -- Ambati et al. (2015), Sect. 3.4: stop when the normalized
+#                 energy-slope angle gamma <= stagger_gamma_tol_deg. tol_rel /
+#                 tol_abs still govern the inner u/phi Newton sub-solves.
+# The inner sub-solves are unaffected; this only ends the outer u/phi sweeps.
+stagger_stop          = "energy"
+stagger_gamma_tol_deg = 10.0    # Ambati's suggested ~10 deg (energy criterion only)
+
+
+
+# -----------------------------------------------------------------------------
+# Load-stepping driver.
+#
+# step_mode selects how the applied load is advanced:
+#
+#   "uniform"    N_steps equal load_factor increments 0 -> 1 (original mode).
+#
+#   "two_stage"  Displacement-controlled two-rate schedule (Ambati et al.):
+#                the applied displacement u is advanced by du_coarse until it
+#                reaches u_switch, then by du_fine to the end. Keyed on the
+#                magnitude of the largest prescribed Dirichlet uy (the "Top" BC
+#                = 0.006 mm here) and converted to a load_factor increment
+#                internally. N_steps is IGNORED in this mode.
+#
+# The adaptive halving safety net applies in both modes: a non-converged step
+# is rolled back and the increment halved (to nominal / 2^6) before giving up.
+#
+# These are Ambati's steel-SENT values. u_switch (5e-3) sits just below the
+# expected load-displacement knee (~5.5e-3) so the fine increments resolve the
+# crack-growth region; it MUST be smaller than the Top uy (0.006).
+# -----------------------------------------------------------------------------
+[run]
+N_steps  = 1       # used only when step_mode = "uniform"
+show_gui = true    # open the Gmsh GUI after the run
+
+# Open the Gmsh GUI AFTER meshing but BEFORE solving, to check the geometry,
+# the refinement zone and the resolved boundary groups. The window BLOCKS the
+# run: close it to start the solve, or Ctrl+C in the terminal to abort.
+#
+# Independent of show_gui above. Set BOTH to false for unattended runs -- a
+# blocking window in a batch job waits forever.
+# CLI: --preview / --no-preview
+preview_mesh = true
+
+step_mode = "two_stage"  # "uniform" or "two_stage"
+du_coarse = 1.0e-4       # coarse displacement increment (mm), pre-knee
+u_switch  = 0.015       # switch to fine increments at this applied u (mm)
+du_fine   = 1.0e-5       # fine displacement increment (mm), through crack growth
+
+# Adaptive half-stepping. On a non-converged increment the driver rolls
+# (u, phi) back to the last converged state and retries with half the
+# increment, up to max_subdivs times (smallest increment reached is
+# nominal / 2^max_subdivs). Applies to both step modes.
+#
+#   max_subdivs > 0   halving ON, at most this many subdivisions (6 = default)
+#   max_subdivs = 0   halving OFF -- a non-converged increment is accepted
+#                     as-is and the run continues
+#
+# WARNING on max_subdivs = 0: this is not recoverable. The history field is
+# committed after every accepted step and H = max(H_stored, psi+) only grows,
+# so spurious psi+ from an unconverged displacement field is baked in
+# permanently and steers the crack path for the rest of the run. Accepted
+# non-converged steps print a warning and are flagged converged = 0 in
+# <base_name>_force_disp.csv -- filter on that column before trusting the
+# force-displacement curve.
+max_subdivs = 0
+
+# Output controls.
+#   output_dir -- parent folder for this run's output directory. Everything the
+#                run produces is written under
+#                    <output_dir>/<base_name>/          log, CSVs, .msh, mesh .vtk
+#                    <output_dir>/<base_name>/vtk/      per-step snapshots
+#                so a parameter study leaves one self-contained folder per run
+#                instead of thousands of loose files.
+#
+#                "." (default) puts the run folder beside the config file.
+#                Point it at a LOCAL path to keep the per-step writes and the
+#                CSV flushes off a synced OneDrive folder -- OneDrive has caused
+#                both a bad-exe-format failure and stalled flushes on this
+#                project. Forward slashes work on Windows:
+#                    output_dir = "C:/pfm-runs"
+#                CLI override: --outdir <path>
+#
+#                If the folder cannot be created the run does NOT abort; it
+#                warns and falls back to the working directory.
+#
+#   vtk_every -- write a VTK snapshot every Nth ACCEPTED step (1 = every step).
+#                Step 0 and the final converged step are always written, and
+#                the force-displacement CSV is still logged every step.
+#   write_log -- mirror all terminal output to "<base_name>_run.txt".
+#
+#   profile_every -- print the per-step [profile] cost breakdown (element
+#                assembly / sparse build / factorize / solve / ...) every Nth
+#                accepted step.
+#                  0 = never (default) -- but the CUMULATIVE breakdown is still
+#                      printed once at the end of the run
+#                  1 = every step (use while tuning performance)
+#                The timers cost ~1 us per multi-second step, so this only
+#                controls log verbosity, not speed.
+output_dir    = 'C:/Users/andre/OneDrive/Documents/Phase Modeling/phase field _newest/build/shear'
+vtk_every     = 50
+write_log     = true
+profile_every = 50

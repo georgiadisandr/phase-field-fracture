@@ -1,0 +1,62 @@
+# =============================================================================
+# RENAME THIS FILE TO  .gitignore  (see step 5)
+#
+# Keeps the repository to source only. Without this, `git add -A` would try to
+# commit the build tree -- including the 89 MB gmsh DLL -- and every .vtk
+# snapshot the solver writes.
+# =============================================================================
+
+# ---- Build trees -------------------------------------------------------------
+build/
+build-*/
+cmake-build-*/
+out/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+
+# ---- Compiled artifacts ------------------------------------------------------
+*.exe
+*.dll
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+
+# ---- Simulation output -------------------------------------------------------
+# Regenerated on every run; large and not worth versioning.
+*.msh
+*.vtk
+*_run.txt
+*_force_disp.csv
+*_stagger_energy.csv
+
+# ---- Editor / OS -------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+desktop.ini
+
+# If you decide you DO want to version your VS Code build settings (the Release
+# default is genuinely useful to keep), delete the ".vscode/" line above and
+# uncomment these two instead:
+# .vscode/*
+# !.vscode/settings.json
+
+# Per-process scratch config written by run_gui.py
+_gui_run_*.toml
+
+# ---- Local GUI state ---------------------------------------------------------
+.phasefield_gui3_state.json
+
+# ---- Backup files ------------------------------------------------------------
+*.bak
+
+# ---- Generated plots / reports ----------------------------------------------
+cost_bench.html
+force_disp_plot.html
+stagger_energy_plot.html

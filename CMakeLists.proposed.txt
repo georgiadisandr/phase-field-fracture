@@ -1,0 +1,158 @@
+﻿# =============================================================================
+# PROPOSED replacement for CMakeLists.txt.
+#
+# Review, then rename to CMakeLists.txt when you're happy with it.
+# Changes vs. the current file are marked [NEW].
+# =============================================================================
+
+cmake_minimum_required(VERSION 3.16)
+project(PhaseFieldFEM1 CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# [NEW] Emit compile_commands.json so you can verify the flags actually used.
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# -----------------------------------------------------------------------------
+# Build type
+# -----------------------------------------------------------------------------
+# NOTE: this only fires when CMAKE_BUILD_TYPE is unset AT FIRST CONFIGURE. If a
+# cache already exists, or an IDE sets it, this does nothing. That is why the
+# loud warning below exists.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING
+        "Build type (Release / Debug / RelWithDebInfo / MinSizeRel)" FORCE)
+endif()
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+
+# [NEW] Shout if this is not an optimized build. An unoptimized Eigen build of
+# this code is roughly 30x slower, which is easy to not notice.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    message(WARNING
+        "=================================================================\n"
+        " Building in DEBUG. Eigen is ~30x slower without optimization.\n"
+        " Use -DCMAKE_BUILD_TYPE=Release for any production run.\n"
+        "=================================================================")
+endif()
+
+# -----------------------------------------------------------------------------
+# [NEW] External paths as cache variables, so the project builds on another
+# machine without editing this file. The defaults are your current paths.
+# -----------------------------------------------------------------------------
+set(EIGEN_DIR "C:/Users/andre/OneDrive/Documents/Phase Modeling/FEM/eigen-5.0.0"
+    CACHE PATH "Root of the Eigen source tree (the dir containing 'Eigen/')")
+set(GMSH_INCLUDE_DIR "C:/Program Files/Gmsh/gmsh-4.15.2-Windows64-sdk/include"
+    CACHE PATH "Gmsh SDK include dir")
+set(GMSH_LIB_DIR "C:/Program Files/Gmsh/gmsh-4.15.2-Windows64-sdk/lib"
+    CACHE PATH "Gmsh SDK lib dir")
+
+if(NOT EXISTS "${EIGEN_DIR}/Eigen/Dense")
+    message(FATAL_ERROR "Eigen not found at EIGEN_DIR=${EIGEN_DIR}")
+endif()
+if(NOT EXISTS "${GMSH_INCLUDE_DIR}/gmsh.h")
+    message(FATAL_ERROR "gmsh.h not found at GMSH_INCLUDE_DIR=${GMSH_INCLUDE_DIR}")
+endif()
+
+# -----------------------------------------------------------------------------
+# Target
+# -----------------------------------------------------------------------------
+add_executable(phasefield_1
+    main.cpp
+    MeshGeneration.cpp
+    Gauss.cpp
+    Jacob2.cpp
+    ShapeFunc.cpp
+    GmshReader.cpp
+    ConstitutiveModel.cpp
+    ElementUtils.cpp
+    StiffnessPFM.cpp
+    ResidualPFM.cpp
+    History.cpp
+    BoundaryConditions.cpp
+    NeumannBC.cpp
+    Solver.cpp
+    Output.cpp
+    Config.cpp
+)
+
+target_include_directories(phasefield_1 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${EIGEN_DIR}
+    ${GMSH_INCLUDE_DIR})
+
+target_link_libraries(phasefield_1 PRIVATE "${GMSH_LIB_DIR}/gmsh-4.15.dll")
+
+# -----------------------------------------------------------------------------
+# [NEW] Optimization
+# -----------------------------------------------------------------------------
+# EIGEN_NO_DEBUG strips Eigen's internal size/alignment assertions. Release
+# already defines NDEBUG, which does most of this, but being explicit is free.
+target_compile_definitions(phasefield_1 PRIVATE $<$<CONFIG:Release>:EIGEN_NO_DEBUG>)
+
+if(MSVC)
+    target_compile_options(phasefield_1 PRIVATE
+        $<$<CONFIG:Release>:/O2 /arch:AVX2 /fp:contract>)
+else()
+    # -march=native is the important one: without it GCC targets baseline
+    # x86-64 (SSE2 only) and Eigen never uses AVX2/FMA. Swap for
+    # -march=x86-64-v3 if the binary must run on another machine.
+    #
+    # DELIBERATELY NOT USING -ffast-math: it implies -ffinite-math-only, which
+    # lets the compiler assume NaN/Inf cannot occur. Solver.cpp relies on
+    # delta.allFinite() to catch a diverging Newton increment, and that check
+    # can be optimized away. -ffp-contract=fast gives you FMA, which is where
+    # most of the -ffast-math benefit is for this code, without that hazard.
+    target_compile_options(phasefield_1 PRIVATE
+        $<$<CONFIG:Release>:-O3 -march=native -funroll-loops -ffp-contract=fast>)
+endif()
+
+# Link-time optimization. Checked rather than assumed, since MinGW setups vary.
+include(CheckIPOSupported)
+check_ipo_supported(RESULT ipo_ok OUTPUT ipo_msg)
+if(ipo_ok)
+    set_property(TARGET phasefield_1
+                 PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+    message(STATUS "LTO/IPO: enabled for Release")
+else()
+    message(STATUS "LTO/IPO: not available (${ipo_msg})")
+endif()
+
+# -----------------------------------------------------------------------------
+# [NEW] OpenMP -- optional, off by default. Nothing in the code is threaded yet,
+# so this only matters once the element assembly loop is parallelized.
+# -----------------------------------------------------------------------------
+option(PFM_USE_OPENMP "Enable OpenMP (for threaded element assembly)" OFF)
+if(PFM_USE_OPENMP)
+    find_package(OpenMP)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(phasefield_1 PRIVATE OpenMP::OpenMP_CXX)
+        target_compile_definitions(phasefield_1 PRIVATE PFM_OPENMP)
+        message(STATUS "OpenMP: enabled")
+    else()
+        message(WARNING "PFM_USE_OPENMP=ON but OpenMP was not found")
+    endif()
+endif()
+
+# -----------------------------------------------------------------------------
+# Windows: copy the gmsh DLL next to the executable
+# -----------------------------------------------------------------------------
+if(WIN32)
+    find_file(GMSH_DLL NAMES gmsh-4.15.dll gmsh.dll
+        HINTS "${GMSH_LIB_DIR}"
+        PATH_SUFFIXES bin lib)
+    if(GMSH_DLL)
+        add_custom_command(TARGET phasefield_1 POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${GMSH_DLL}" "$<TARGET_FILE_DIR:phasefield_1>")
+    else()
+        message(WARNING "gmsh DLL not found; phasefield_1.exe will fail to start at runtime")
+    endif()
+endif()
+
+# -----------------------------------------------------------------------------
+# [NEW] Print the flags that will actually be used, so a Debug build can't hide.
+# -----------------------------------------------------------------------------
+message(STATUS "CXX flags (Release): ${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_RELEASE}")
+message(STATUS "CXX flags (Debug)  : ${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_DEBUG}")

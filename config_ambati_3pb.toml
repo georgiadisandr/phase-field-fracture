@@ -1,0 +1,147 @@
+# =============================================================================
+# Ambati / Miehe notched three-point bending beam.
+#
+#   8 x 2 mm, V-notch 0.2 wide x 0.4 deep at midspan, simply supported at the
+#   ends, prescribed downward displacement u at the top centre.
+#
+# RUN IT
+#   python mesh/from_spec.py mesh/specs/tpb_notched.toml --out meshes/tpb_ambati.msh
+#   build\phasefield_1.exe config_ambati_3pb.toml --mesh-only     <-- check first
+#   build\phasefield_1.exe config_ambati_3pb.toml
+#
+# Units throughout: mm, MPa, N/mm.
+# =============================================================================
+
+[mesh]
+source    = "file"
+path      = "tpb_notched.msh"
+base_name = "ambati_3pb_isotropic"
+
+[fem]
+ntype        = 2          # plane strain
+ndofn        = 2
+ngaus        = 2
+nstre        = 3
+energy_split = "none" # Ambati drive the phase field with the Miehe split
+hybrid       = true       # Ambati's hybrid formulation: linear u-solve
+
+# -----------------------------------------------------------------------------
+# Material -- the benchmark values from the literature (Miehe et al. 2010,
+# reproduced by Ambati, Gerasimov & De Lorenzis 2015).
+#
+#   E  = 20.8 kN/mm^2 = 20800 MPa
+#   nu = 0.3
+#   Gc = 0.5 N/mm
+#   l0 = 0.06 mm      (the coarser of the two values reported; 0.03 is the
+#                      other, and needs a finer mesh -- see the note below)
+#
+# THE l0 / MESH CONSTRAINT IS NOT OPTIONAL. The phase-field band has width
+# ~2*l0, so the mesh must put several elements across it or the crack becomes
+# mesh-dependent and the peak load is wrong. The rule is l0 >= 2h; l0 >= 4h is
+# where results stop moving.
+#
+#   this mesh:  h = 0.02 in the crack corridor  ->  l0/h = 3.0    acceptable
+#   for l0 = 0.03 you need h <= 0.015: regenerate with
+#       python mesh/from_spec.py mesh/specs/tpb_notched.toml \
+#              --set ... (edit the [[refine]] box h to 0.01) --out meshes/tpb_fine.msh
+#
+# Gc and l0 together set the strength. Halving l0 raises the peak load, so
+# these two numbers are not independently tunable -- change l0 and you have
+# changed the material, not just the discretisation.
+# -----------------------------------------------------------------------------
+[[materials]]
+name  = "miehe_beam"
+props = [ 20800.0, 0.3, 0.54, 3.0e-2, 1e-9 ]   # { E, nu, Gc, l0, k }
+
+[[material_for_group]]
+group    = "Domain"
+material = "miehe_beam"
+
+# -----------------------------------------------------------------------------
+# Supports and load -- the point idealisation the figure draws.
+#
+#   SupportLeftPoint   pinned in x and y   (removes translation and rotation)
+#   SupportRightPoint  roller, y only      (free in x)
+#   LoadPoint          prescribed uy       (displacement control, downward)
+#
+# The roller matters. Pinning both supports in x adds an axial restraint, so
+# the beam carries membrane tension as it deflects -- that stiffens the
+# response and moves the peak load. It is a common and silent mistake.
+#
+# To spread the reactions instead, swap these three names for "SupportLeft",
+# "SupportRight" and "LoadPad" -- the same mesh carries both group sets. A
+# point restraint concentrates the whole reaction on one node, and the
+# singularity that creates sits exactly where the reaction is measured; in a
+# phase-field model it can nucleate damage under the support rather than at
+# the notch. The solver prints a [bc] note whenever a BC lands on a point.
+# -----------------------------------------------------------------------------
+[[bcs]]
+physical_name = "SupportLeft"
+flags         = [1, 1]
+values        = [0.0, 0.0]
+
+[[bcs]]
+physical_name = "SupportRight"
+flags         = [0, 1]
+values        = [0.0, 0.0]
+
+[[bcs]]
+physical_name = "LoadPad"
+flags         = [0, 1]
+values        = [0.0, -0.12]    # applied uy at full load (mm), downward
+
+# -----------------------------------------------------------------------------
+# Solver. Staggered with Ambati's energy-gamma stopping criterion, which is
+# what their hybrid paper uses.
+# -----------------------------------------------------------------------------
+[solver]
+tol_rel               = 1.0e-6
+tol_abs               = 1.0e-8
+max_iter              = 100
+verbose               = true
+scheme                = "staggered"
+max_staggered         = 20
+stagger_stop          = "energy"
+stagger_gamma_tol_deg = 10.0
+
+# -----------------------------------------------------------------------------
+# Load stepping. Coarse increments to just before the knee, fine through crack
+# growth. Miehe's beam reaches peak load somewhere near u ~ 0.02 mm and then
+# softens, so u_switch must sit BELOW that: the fine increments have to start
+# before the peak, not after it, or the snap-back is stepped straight over.
+#
+# u_switch WAS 4.0e-2, i.e. ABOVE the peak -- so nucleation and the whole early
+# crack growth were being resolved at du_coarse = 1e-3, about 20 steps to reach
+# the peak. That is too coarse to get the peak load right, and it also meant a
+# VTK stride landed exactly ONE frame (step 0) before u = 0.04: the snapshots
+# jumped from a pristine beam to an already-cracked one with nothing between.
+#
+# 1.5e-2 puts the knee and the propagation window inside the fine range.
+#
+# STEP COUNT, honestly: 15 coarse + (u_max - 0.015)/1e-5 fine. With u_max still
+# at 0.12 that is 10,500 fine steps -- MORE than before, because the fine range
+# now starts earlier. Trimming u_max is what brings this back down; see the
+# LoadPad BC value above. If the run is still too slow, raise du_fine before
+# touching max_subdivs.
+# -----------------------------------------------------------------------------
+[run]
+step_mode     = "two_stage"
+du_coarse     = 1.0e-3     # -> 15 steps to u_switch
+u_switch      = 1.5e-2     # below the expected peak (~0.02)
+du_fine       = 1.0e-5     # -> (u_max - u_switch)/du_fine steps
+# 0 = NO adaptive halving. A step that fails to converge is FORCE-ACCEPTED and
+# its state goes into the irreversible history field, where it cannot be undone.
+# Raise this to 2-3 if the log shows non-converged steps (the GUI marks them red
+# on the curve).
+max_subdivs   = 0
+
+show_gui      = false
+preview_mesh  = false      # set true once to eyeball the mesh before committing
+
+# Point this somewhere LOCAL, not OneDrive: the run writes a VTK per stride and
+# flushes the CSV every step, and OneDrive has caused both a bad-exe-format
+# failure and stalled flushes on this project.
+output_dir    = "."
+vtk_every     = 100
+write_log     = true
+profile_every = 100
