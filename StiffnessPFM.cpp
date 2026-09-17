@@ -3,6 +3,9 @@
 #include "ElementUtils.h"
 #include "Jacob2.h"
 #include "Profiling.h"
+
+#include <algorithm>
+#include <cstddef>
 #include "ShapeFunc.h"
 
 #include <algorithm>
@@ -222,6 +225,93 @@ void extractElement(const std::vector<int>& nodes,
         phi_elem(i)       = phi_global(node);
         gdof[ndofu + i]   = 2 * npoin + node;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-pattern assembly.
+//
+// The mesh never changes during a run, so the global sparsity pattern of the
+// u and phi sub-systems is built ONCE and then only its numeric values are
+// refilled. 'slots' maps each element entry (e, a, b) to the index of its
+// stored coefficient in the compressed matrix, so an assembly pass is a
+// sequence of  values[slot] += Ke(a,b)  instead of emitting millions of
+// triplets and re-running setFromTriplets() / makeCompressed().
+//
+// The pattern holds every structural entry, zeros included (as the triplet
+// version did), so the symbolic factorization stays valid for the whole run.
+// ---------------------------------------------------------------------------
+struct PatternCache {
+    Eigen::SparseMatrix<double> pattern;   // structure, all values 0
+    std::vector<int>            slots;     // element entry -> coefficient index
+    std::vector<std::size_t>    off;       // element -> offset into 'slots'
+    const FemInput*             owner = nullptr;
+    bool                        built = false;
+};
+
+// Index of entry (row, col) among the stored coefficients. Inner indices of a
+// compressed column-major matrix are sorted, so this is a binary search.
+int storedIndex(const Eigen::SparseMatrix<double>& K, int row, int col)
+{
+    const int* rows  = K.innerIndexPtr();
+    const int* start = K.outerIndexPtr();
+    const int* first = rows + start[col];
+    const int* last  = rows + start[col + 1];
+    const int* p     = std::lower_bound(first, last, row);
+    if (p == last || *p != row)
+        throw std::runtime_error(
+            "fixed-pattern assembly: entry missing from the cached pattern");
+    return static_cast<int>(p - rows);
+}
+
+// Global dofs of element e. 'u_block' selects the displacement sub-system
+// (2 dofs per node, node-major) or the phase-field one (1 dof per node).
+void elementDofs(const FemInput& d, int e, bool u_block, std::vector<int>& g)
+{
+    const int nnode = d.offset[e + 1] - d.offset[e];
+    g.resize(u_block ? 2 * nnode : nnode);
+    for (int i = 0; i < nnode; ++i) {
+        const int node = d.conn[d.offset[e] + i];
+        if (u_block) { g[2 * i] = 2 * node; g[2 * i + 1] = 2 * node + 1; }
+        else         { g[i]     = node; }
+    }
+}
+
+void buildPattern(const FemInput& d, bool u_block, PatternCache& c)
+{
+    const int total = u_block ? 2 * d.npoin : d.npoin;
+    const int nd_max = u_block ? 8 : 4;    // Quad4 reserve hint only
+
+    std::vector<Eigen::Triplet<double>> trips;
+    trips.reserve(static_cast<std::size_t>(d.nelem) * nd_max * nd_max);
+
+    std::vector<int> g;
+    c.off.assign(static_cast<std::size_t>(d.nelem) + 1, 0);
+    for (int e = 0; e < d.nelem; ++e) {
+        elementDofs(d, e, u_block, g);
+        const int nd = static_cast<int>(g.size());
+        for (int a = 0; a < nd; ++a)
+            for (int b = 0; b < nd; ++b)
+                trips.emplace_back(g[a], g[b], 0.0);
+        c.off[e + 1] = c.off[e] + static_cast<std::size_t>(nd) * nd;
+    }
+
+    c.pattern.resize(total, total);
+    c.pattern.setFromTriplets(trips.begin(), trips.end());
+    c.pattern.makeCompressed();
+    c.pattern.coeffs().setZero();          // setFromTriplets summed the zeros
+
+    c.slots.resize(c.off.back());
+    for (int e = 0; e < d.nelem; ++e) {
+        elementDofs(d, e, u_block, g);
+        const int   nd = static_cast<int>(g.size());
+        std::size_t k  = c.off[e];
+        for (int a = 0; a < nd; ++a)
+            for (int b = 0; b < nd; ++b)
+                c.slots[k++] = storedIndex(c.pattern, g[a], g[b]);
+    }
+
+    c.owner = &d;
+    c.built = true;
 }
 
 }  // namespace
@@ -472,8 +562,15 @@ assembleU_System(const FemInput&        d,
     USystem sys;
     sys.R = Eigen::VectorXd::Zero(total);
 
-    std::vector<Eigen::Triplet<double>> trips;
-    trips.reserve(static_cast<std::size_t>(d.nelem) * 8 * 8);
+    // Reuse the cached sparsity pattern: copying it gives a compressed matrix
+    // with the right structure and all-zero values, ready to be refilled.
+    static PatternCache cache;
+    {
+        prof::Scope _t(prof::SparseBuild);
+        if (!cache.built || cache.owner != &d) buildPattern(d, /*u_block=*/true, cache);
+        sys.K = cache.pattern;
+    }
+    double* vals = sys.K.valuePtr();
 
     std::vector<int> nodes;
     Eigen::VectorXd  u_elem, phi_elem, re_u;
@@ -490,24 +587,16 @@ assembleU_System(const FemInput&        d,
             elementUSystem(nodes, d.matno[e], d, u_elem, phi_elem,
                            history[e], /*want_K=*/true, Ke_uu, re_u);
 
-            const int ndofu = 2 * static_cast<int>(nodes.size());
+            const int   ndofu = 2 * static_cast<int>(nodes.size());
+            std::size_t k     = cache.off[e];
             for (int a = 0; a < ndofu; ++a) {
                 sys.R(gdof[a]) += re_u(a);
-                for (int b = 0; b < ndofu; ++b) {
-                    // Emit every structural entry (as in assembleGlobalSystem)
-                    // so the LDLT symbolic analysis can be cached across iters.
-                    trips.emplace_back(gdof[a], gdof[b], Ke_uu(a, b));
-                }
+                for (int b = 0; b < ndofu; ++b)
+                    vals[cache.slots[k++]] += Ke_uu(a, b);
             }
         }
     }
 
-    {
-        prof::Scope _t(prof::SparseBuild);
-        sys.K.resize(total, total);
-        sys.K.setFromTriplets(trips.begin(), trips.end());
-        sys.K.makeCompressed();
-    }
     return sys;
 }
 
@@ -533,8 +622,13 @@ assemblePhi_System(const FemInput&        d,
     PhiSystem sys;
     sys.R = Eigen::VectorXd::Zero(npoin);
 
-    std::vector<Eigen::Triplet<double>> trips;
-    trips.reserve(static_cast<std::size_t>(d.nelem) * 4 * 4);
+    static PatternCache cache;
+    {
+        prof::Scope _t(prof::SparseBuild);
+        if (!cache.built || cache.owner != &d) buildPattern(d, /*u_block=*/false, cache);
+        sys.K = cache.pattern;
+    }
+    double* vals = sys.K.valuePtr();
 
     std::vector<int> nodes;
     Eigen::VectorXd  u_elem, phi_elem, re_phi;
@@ -564,21 +658,15 @@ assemblePhi_System(const FemInput&        d,
             elementPhiSystem(nodes, d.matno[e], d, u_elem, phi_elem,
                              history[e], /*want_K=*/true, Ke_phiphi, re_phi);
 
+            std::size_t k = cache.off[e];
             for (int a = 0; a < nnode; ++a) {
                 sys.R(nodes[a]) += re_phi(a);
-                for (int b = 0; b < nnode; ++b) {
-                    trips.emplace_back(nodes[a], nodes[b], Ke_phiphi(a, b));
-                }
+                for (int b = 0; b < nnode; ++b)
+                    vals[cache.slots[k++]] += Ke_phiphi(a, b);
             }
         }
     }
 
-    {
-        prof::Scope _t(prof::SparseBuild);
-        sys.K.resize(npoin, npoin);
-        sys.K.setFromTriplets(trips.begin(), trips.end());
-        sys.K.makeCompressed();
-    }
     return sys;
 }
 

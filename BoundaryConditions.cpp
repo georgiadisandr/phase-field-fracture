@@ -51,38 +51,50 @@ void applyDirichlet(Eigen::SparseMatrix<double>& K,
     if (!any) return;
 
     // -----------------------------------------------------------------------
-    // 2. Build a new K with constrained rows/columns replaced by identity
-    //    rows/columns, applying the RHS correction for the displacement
-    //    increment.  We use a triplet rebuild so the resulting pattern is
-    //    exactly what SparseLU needs (no structural zeros, no ghost entries).
+    // 2. Rewrite the constrained rows/columns IN PLACE.
+    //
+    //    The sparsity pattern is fixed for the whole run (StiffnessPFM builds
+    //    it once), so there is nothing to rebuild here: the constrained
+    //    entries are simply overwritten with 0, the constrained diagonals with
+    //    1, and the RHS is corrected for the prescribed increment. Every
+    //    constrained dof belongs to at least one element, so its diagonal
+    //    exists in the pattern; if it does not, that is a bug, not a case to
+    //    paper over -- hence the throw.
+    //
+    //    The result is numerically identical to the old triplet rebuild; it
+    //    only keeps the zeroed entries stored (as explicit zeros) instead of
+    //    dropping them from the pattern.
     // -----------------------------------------------------------------------
-    std::vector<Eigen::Triplet<double>> trips;
-    trips.reserve(static_cast<std::size_t>(K.nonZeros()));
-
     for (int j = 0; j < K.outerSize(); ++j) {
         const bool j_constrained = (mask[j] != 0);
+        bool       diag_seen     = false;
+
         for (Eigen::SparseMatrix<double>::InnerIterator it(K, j); it; ++it) {
-            const int    i = static_cast<int>(it.row());
-            const double v = it.value();
-            if (mask[i]) { continue; }                  // constrained row: skip
-            if (j_constrained) {                        // free row, constrained col
-                R(i) += v * delta_prescribed[j];        // RHS correction
-                continue;
+            const int i = static_cast<int>(it.row());
+
+            if (j_constrained) {
+                if (i == j) {                       // constrained diagonal -> 1
+                    it.valueRef() = 1.0;
+                    diag_seen     = true;
+                    continue;
+                }
+                if (!mask[i])                       // free row, constrained col
+                    R(i) += it.value() * delta_prescribed[j];
+                it.valueRef() = 0.0;                // drop the coupling
+            } else if (mask[i]) {                   // constrained row, free col
+                it.valueRef() = 0.0;
             }
-            trips.emplace_back(i, j, v);                // free-free entry
         }
-    }
-    // Constrained DOFs: identity diagonal + prescribed increment in RHS.
-    for (int r = 0; r < total; ++r) {
-        if (!mask[r]) continue;
-        trips.emplace_back(r, r, 1.0);
-        R(r) = -delta_prescribed[r];
+
+        if (j_constrained && !diag_seen)
+            throw std::runtime_error(
+                "applyDirichlet: constrained dof has no stored diagonal -- the "
+                "matrix pattern does not cover it");
     }
 
-    Eigen::SparseMatrix<double> K_new(total, total);
-    K_new.setFromTriplets(trips.begin(), trips.end());
-    K_new.makeCompressed();
-    K.swap(K_new);
+    // Constrained DOFs: prescribed increment on the RHS (K(r,r) is now 1).
+    for (int r = 0; r < total; ++r)
+        if (mask[r]) R(r) = -delta_prescribed[r];
 }
 
 }  // namespace pfm

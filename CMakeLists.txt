@@ -137,6 +137,29 @@ if(PFM_USE_OPENMP)
 endif()
 
 # -----------------------------------------------------------------------------
+# CHOLMOD (SuiteSparse) -- optional, off by default.
+#   MSYS2 UCRT64:  pacman -S mingw-w64-ucrt-x86_64-suitesparse
+#                             mingw-w64-ucrt-x86_64-openblas
+#   Configure:     cmake -DPFM_USE_CHOLMOD=ON ..
+# Switches the staggered u / phi sub-solves to CholmodSupernodalLLT.
+# -----------------------------------------------------------------------------
+option(PFM_USE_CHOLMOD "Use SuiteSparse CHOLMOD (supernodal) for SPD sub-solves" OFF)
+if(PFM_USE_CHOLMOD)
+    # CHOLMOD's package config looks up OpenMP for C, so C must be enabled.
+    enable_language(C)
+    find_package(CHOLMOD CONFIG REQUIRED)
+    if(TARGET SuiteSparse::CHOLMOD)
+        target_link_libraries(phasefield_1 PRIVATE SuiteSparse::CHOLMOD)
+    else()
+        target_link_libraries(phasefield_1 PRIVATE SuiteSparse::CHOLMOD_static)
+    endif()
+    target_compile_definitions(phasefield_1 PRIVATE PFM_USE_CHOLMOD)
+    message(STATUS "Linear solver: CHOLMOD supernodal (CHOLMOD ${CHOLMOD_VERSION})")
+else()
+    message(STATUS "Linear solver: Eigen SimplicialLDLT")
+endif()
+
+# -----------------------------------------------------------------------------
 # Windows runtime dependencies
 #
 # THE FAILURE THIS PREVENTS: exit code 3221225781 (0xC0000135,
@@ -178,7 +201,16 @@ if(WIN32)
     # so the build folder stays self-contained if MSYS2 is ever moved.
     if(MINGW)
         get_filename_component(_mingw_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
-        foreach(_dll libgcc_s_seh-1.dll libstdc++-6.dll libwinpthread-1.dll)
+        set(_rt_dlls libgcc_s_seh-1.dll libstdc++-6.dll libwinpthread-1.dll)
+        if(PFM_USE_CHOLMOD)
+            # CHOLMOD and everything it pulls in (SuiteSparse, OpenBLAS,
+            # gfortran/OpenMP runtimes). Missing names are simply skipped.
+            list(APPEND _rt_dlls
+                libcholmod.dll libsuitesparseconfig.dll libamd.dll libcamd.dll
+                libcolamd.dll libccolamd.dll libmetis.dll libopenblas.dll
+                libgomp-1.dll libgfortran-5.dll libquadmath-0.dll)
+        endif()
+        foreach(_dll ${_rt_dlls})
             if(EXISTS "${_mingw_bin}/${_dll}")
                 add_custom_command(TARGET phasefield_1 POST_BUILD
                     COMMAND ${CMAKE_COMMAND} -E copy_if_different
