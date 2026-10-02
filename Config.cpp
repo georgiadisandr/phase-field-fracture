@@ -392,6 +392,27 @@ void loadRunSection(const toml::table& root, AppConfig& cfg)
     if (readScalar<int64_t>(*tbl, "max_subdivs", msd))
         cfg.step.max_subdivs = static_cast<int>(msd);
 
+    // Load control: "displacement" (default) or "dissipation".
+    std::string lc;
+    if (readString(*tbl, "load_control", lc)) {
+        for (auto& c : lc) c = static_cast<char>(std::tolower(c));
+        if (lc == "displacement")
+            cfg.step.load_control = LoadControl::Displacement;
+        else if (lc == "dissipation")
+            cfg.step.load_control = LoadControl::Dissipation;
+        else
+            throw std::runtime_error(
+                "run.load_control must be \"displacement\" or \"dissipation\" "
+                "(got \"" + lc + "\")");
+    }
+    readDouble(*tbl, "dissipation_step",       cfg.step.dissipation_step);
+    readDouble(*tbl, "dissipation_switch",     cfg.step.dissipation_switch);
+    readDouble(*tbl, "dissipation_max_du",     cfg.step.dissipation_max_du);
+    readDouble(*tbl, "dissipation_tol",        cfg.step.dissipation_tol);
+    int64_t dms = 0;
+    if (readScalar<int64_t>(*tbl, "dissipation_max_steps", dms))
+        cfg.step.dissipation_max_steps = static_cast<int>(dms);
+
     // Output controls.
     readString(*tbl, "output_dir", cfg.output_dir);
     int64_t ve = 0;
@@ -562,6 +583,24 @@ void validate(const AppConfig& cfg)
                     "run.u_switch2 must be > run.u_switch in three_stage mode "
                     "(the second stage would otherwise have zero width)");
         }
+    }
+    if (cfg.step.load_control == LoadControl::Dissipation) {
+        if (cfg.step.dissipation_step <= 0.0)
+            throw std::invalid_argument(
+                "run.dissipation_step (dtau) must be > 0 when "
+                "run.load_control = \"dissipation\"");
+        if (cfg.solver.scheme != pfm::SolverScheme::Staggered)
+            throw std::invalid_argument(
+                "run.load_control = \"dissipation\" is implemented for "
+                "solver.scheme = \"staggered\" only");
+        if (!cfg.fem.hybrid)
+            throw std::invalid_argument(
+                "run.load_control = \"dissipation\" needs fem.hybrid = true "
+                "(the u-sub-problem must be linear in the load factor)");
+        if (cfg.step.dissipation_max_steps <= 0)
+            throw std::invalid_argument("run.dissipation_max_steps must be > 0");
+        if (cfg.step.dissipation_tol <= 0.0)
+            throw std::invalid_argument("run.dissipation_tol must be > 0");
     }
     if (cfg.solver.max_iter <= 0)
         throw std::invalid_argument("solver.max_iter must be > 0");

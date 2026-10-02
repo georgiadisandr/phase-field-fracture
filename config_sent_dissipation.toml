@@ -1,0 +1,66 @@
+# Dissipation-control test case (SENT tension, coarse) used to validate
+# run.load_control = "dissipation". Runs in a few minutes; the crack leaves the
+# refined zone late in the run, so only the part up to ~u = 0.0062 mm is
+# physically meaningful. Compare with load_control = "displacement".
+[mesh]
+source="builtin"
+W=1.0
+H=1.0
+a=0.5
+h_fine=7.5e-3
+h_far=8.0e-2
+r_fine=0.12
+r_far=0.3
+base_name="SENT_dissipation_test"
+
+[fem]
+ntype=2
+ndofn=2
+ngaus=2
+nstre=3
+energy_split="spectral"
+hybrid=true
+
+[[materials]]
+name="steel"
+props=[210000.0, 0.3, 2.7, 1.5e-2, 1e-9]
+
+[[material_for_group]]
+group="Domain"
+material="steel"
+
+[[bcs]]
+physical_name="Bottom"
+flags=[1,1]
+values=[0.0,0.0]
+
+[[bcs]]
+physical_name="Top"
+flags=[1,1]
+values=[0.0,0.008]
+
+[solver]
+tol_rel=1.0e-5
+tol_abs=1.0e-8
+max_iter=20
+verbose=true
+scheme="staggered"
+max_staggered=500
+stagger_stop="residual"
+
+[run]
+show_gui=false
+preview_mesh=false
+step_mode="two_stage"
+du_coarse=2.0e-4
+u_switch=4.0e-3
+du_fine=2.0e-5
+max_subdivs=6
+vtk_every=10
+write_log=true
+profile_every=0
+
+load_control="dissipation"
+dissipation_step=5.0e-3
+dissipation_switch=3.0e-3
+dissipation_max_du=2.0e-4

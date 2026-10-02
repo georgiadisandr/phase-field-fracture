@@ -307,6 +307,59 @@ du_fine   = 1.0e-5       # fine displacement increment (mm), through crack growt
 # force-displacement curve.
 max_subdivs = 0
 
+# -----------------------------------------------------------------------------
+# Load control: what drives the load factor.
+#
+#   "displacement" (default) -- the load factor follows step_mode above.
+#
+#   "dissipation"  -- dissipation-controlled path following (energy-release
+#                     arc-length). The run starts on the step_mode schedule.
+#                     Once ONE accepted step raises E_fracture by
+#                     >= dissipation_switch, every following step is sized so
+#                     that the crack energy E_fracture grows by
+#                     dissipation_step (dtau), and the load factor becomes an
+#                     output of the step -- it can DECREASE, which is how a
+#                     snap-back is followed. Per staggered sweep:
+#                       u_hat  = u-solve at load factor 1 (phi frozen)
+#                       lambda : 1-D root-find so that the phi-solve with
+#                                u = lambda*u_hat gives E_fracture = E_n + dtau
+#                                (a few cheap phi-solves, no extra u-solves)
+#                       u      = lambda * u_hat
+#                     Requires: solver.scheme = "staggered", fem.hybrid = true,
+#                     pure Dirichlet loading (no [[neumann]] / [[point_load]]).
+#                     Writes <base_name>_dissipation.csv (lambda, Psi_el,
+#                     E_fracture, dGamma per step, energy-balance cross-check,
+#                     phi-solves, mode, ...).
+#
+#   dissipation_step       -- dtau, crack-energy increase per controlled step,
+#                             in the units of E_fracture (N*mm per mm
+#                             thickness). Start around 1/200 - 1/500 of the
+#                             total expected fracture energy (~Gc * crack
+#                             length).
+#   dissipation_switch     -- switch threshold on the per-step E_fracture
+#                             increase (default = dissipation_step). It must be
+#                             reached BEFORE the unstable jump -- if the
+#                             switch happens on the jump step itself, lower it
+#                             (check the dGamma_step column of the CSV).
+#   dissipation_max_du     -- cap on |change of applied u| per controlled step
+#                             in mm (0 = 10 x the current stage's du). If dtau
+#                             is not reachable within it the step is accepted
+#                             on the cap (capped = 1 in the CSV).
+#   dissipation_max_steps  -- stop after this many controlled steps.
+#   dissipation_tol        -- acceptance: |dGamma - dtau| <= tol * dtau.
+#
+# Use a residual stagger_stop with a generous max_staggered (e.g. 200-500):
+# the per-sweep root-find keeps the crack energy pinned, so steps through the
+# peak converge in tens of sweeps instead of hundreds.
+# A non-converged controlled step halves dtau (max_subdivs > 0) instead of du.
+# -----------------------------------------------------------------------------
+load_control           = "displacement"   # "displacement" or "dissipation"
+dissipation_step       = 1.0e-4
+# dissipation_switch     = 1.0e-4
+# dissipation_max_du     = 0.0
+# dissipation_max_steps  = 100000
+# dissipation_tol        = 1.0e-2
+
 # Output controls.
 #   output_dir -- parent folder for this run's output directory. Everything the
 #                run produces is written under

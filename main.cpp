@@ -26,6 +26,8 @@
 #include "Profiling.h"
 #include "ResidualPFM.h"
 #include "Solver.h"
+#include "StiffnessPFM.h"   // computeEnergy (dissipation control)
+#include "NeumannBC.h"     // assembleExternalForce (dissipation-control check)
 
 #include <gmsh.h>
 
@@ -586,6 +588,59 @@ int main(int argc, char** argv) try
                   << " equal load_factor increments  (set run.du to give the "
                      "displacement increment instead)\n";
 
+    // ---- Dissipation control (run.load_control = "dissipation") ----------
+    // The run starts on the displacement schedule above. After each accepted
+    // step its crack-energy increase dGamma = E_fracture - E_fracture_n is
+    // measured; once one step reaches dissipation_switch the driver switches to
+    // dissipation control: every following step must raise E_fracture by dtau,
+    // and the load factor becomes an output of the step (it may decrease ->
+    // snap-back). See pfm::DissipationControl in Solver.h for the per-sweep
+    // update. The released energy from the external energy balance
+    //     dD_bal = 1/2 ( P_n lambda_{n+1} - P_{n+1} lambda_n ),  P = 2 Psi_el/lambda
+    // is logged alongside, as a cross-check.
+    const bool diss_mode =
+        (cfg.step.load_control == appcfg::LoadControl::Dissipation);
+    bool   diss_on      = false;  // currently under dissipation control
+    bool   diss_done    = false;  // switched back for good (specimen unloaded)
+    double psi_n        = 0.0;    // elastic energy of the last accepted state
+    double psi_max      = 0.0;    // largest accepted elastic energy so far
+    double gamma_n      = 0.0;    // crack energy E_fracture of that state
+    double dlam_last    = 0.0;    // last accepted load-factor increment
+    double dgam_last    = 0.0;    // last accepted crack-energy increment
+    double D_cum        = 0.0;    // cumulative crack-energy increase
+    double D_bal_cum    = 0.0;    // cumulative energy-balance dissipation
+    double D_target     = 0.0;    // cumulative target (dissipation steps only)
+    double dtau_cur     = cfg.step.dissipation_step;  // halved on failure
+    int    diss_steps   = 0;
+    int    diss_success = 0;
+    const double diss_switch = (cfg.step.dissipation_switch > 0.0)
+                                   ? cfg.step.dissipation_switch
+                                   : cfg.step.dissipation_step;
+    std::ofstream diss_csv;
+    if (diss_mode) {
+        if (loaded_dof.empty() || u_ref == 0.0)
+            throw std::runtime_error(
+                "run.load_control = \"dissipation\" needs a nonzero prescribed "
+                "Dirichlet displacement (no loaded edge was found)");
+        if ((pfm::assembleExternalForce(d).array() != 0.0).any())
+            throw std::runtime_error(
+                "run.load_control = \"dissipation\" supports pure Dirichlet "
+                "loading only: remove [[neumann]] / [[point_load]] entries");
+        diss_csv.open(inDir(run_dir, cfg.mesh.base_name + "_dissipation.csv"));
+        diss_csv << "step,mode,lambda,applied_u" << dir_name
+                 << ",dlambda,Psi_elastic,E_fracture,dGamma_step,D_cum,"
+                    "dD_balance_step,D_balance_cum,dD_target,"
+                    "phi_solves,bisections,capped,converged\n";
+        std::cout << "[step] DISSIPATION CONTROL enabled: dtau = "
+                  << cfg.step.dissipation_step << ", switch when a step "
+                  << "raises E_fracture by >= " << diss_switch
+                  << ", max |du| per step = "
+                  << (cfg.step.dissipation_max_du > 0.0
+                          ? std::to_string(cfg.step.dissipation_max_du)
+                          : std::string("10 x stage du"))
+                  << ", max steps = " << cfg.step.dissipation_max_steps << "\n";
+    }
+
     double lf_done        = 0.0;
     double lf_inc         = nominal_inc(0.0);
     double previous_nominal = lf_inc;
@@ -600,6 +655,21 @@ int main(int argc, char** argv) try
     Eigen::VectorXd phi_saved = phi;
 
     while (lf_done < 1.0 - 1e-12) {
+        if (diss_on && diss_steps >= cfg.step.dissipation_max_steps) {
+            std::cout << "\n[step] dissipation control: reached "
+                         "run.dissipation_max_steps = "
+                      << cfg.step.dissipation_max_steps << " -- stopping.\n";
+            break;
+        }
+        // Specimen no longer carries load: the constraint is meaningless, so
+        // finish the run under displacement control.
+        if (diss_on && psi_n <= 1e-8 * psi_max) {
+            diss_on   = false;
+            diss_done = true;
+            std::cout << "\n[step] dissipation control: elastic energy ~0 "
+                         "(specimen unloaded) -- back to displacement control.\n";
+        }
+
         // Current stage's nominal increment (changes when u crosses u_switch).
         const double nominal = nominal_inc(lf_done);
         // Start a new stage with the increment requested for that stage.  This
@@ -633,10 +703,50 @@ int main(int argc, char** argv) try
             }
         }
 
-        std::cout << "\n=== trying load_factor = " << lf_try
-                  << "  (inc = " << lf_inc
-                  << ", step_index = " << (step_index + 1)
-                  << ", subdivs = " << subdiv_streak << ") ===\n";
+        // Dissipation-controlled step set-up: lambda is an unknown, lf_try
+        // above is ignored and replaced by the solver's lambda.
+        pfm::DissipationControl dc;
+        double dD_eff = 0.0;
+        if (diss_on) {
+            // Cumulative target: aim at D_target + dtau so that a step that
+            // over/under-shot is corrected by the next one (bounded).
+            dD_eff = dtau_cur + (D_target - D_cum);
+            dD_eff = std::min(std::max(dD_eff, 0.5 * dtau_cur), 2.0 * dtau_cur);
+
+            const double du_cap = (cfg.step.dissipation_max_du > 0.0)
+                                      ? cfg.step.dissipation_max_du
+                                      : 10.0 * nominal * u_ref;
+            dc.lambda_n    = lf_done;
+            dc.Gamma_n     = gamma_n;
+            dc.dD          = dD_eff;
+            dc.dlambda_max = du_cap / u_ref;
+            dc.tol         = cfg.step.dissipation_tol;
+            // Predictor: extrapolate the last step along the path, scaled to
+            // the wanted crack-energy increase (works through a snap-back,
+            // where dlam_last < 0).
+            double dl = nominal;
+            if (dlam_last != 0.0 && dgam_last > 0.0)
+                dl = dlam_last * (dD_eff / dgam_last);
+            else if (dlam_last != 0.0)
+                dl = dlam_last;
+            dl = std::min(std::max(dl, -dc.dlambda_max), dc.dlambda_max);
+            dc.lambda_pred = lf_done + dl;
+            if (dc.lambda_pred <= 0.0) dc.lambda_pred = 0.5 * lf_done;
+            // Rough dGamma/dlambda for the first secant step.
+            dc.slope = (dlam_last != 0.0 && dgam_last > 0.0)
+                           ? dgam_last / std::abs(dlam_last) : 0.0;
+
+            std::cout << "\n=== dissipation step: dD = " << dD_eff
+                      << "  (dtau = " << dtau_cur
+                      << ", lambda_n = " << lf_done
+                      << ", step_index = " << (step_index + 1)
+                      << ", subdivs = " << subdiv_streak << ") ===\n";
+        } else {
+            std::cout << "\n=== trying load_factor = " << lf_try
+                      << "  (inc = " << lf_inc
+                      << ", step_index = " << (step_index + 1)
+                      << ", subdivs = " << subdiv_streak << ") ===\n";
+        }
 
         const auto t_step_start = clock::now();
         // Snapshot the profiler so the per-step report below shows only this
@@ -644,7 +754,9 @@ int main(int argc, char** argv) try
         const prof::Registry prof_before = prof::reg();
 
         const pfm::SolverResult res =
-            pfm::solveStep(d, u, phi, history, lf_try, cfg.solver);
+            diss_on ? pfm::solveStepDissipation(d, u, phi, history, dc, cfg.solver)
+                    : pfm::solveStep(d, u, phi, history, lf_try, cfg.solver);
+        if (diss_on) lf_try = dc.lambda;   // the step's load factor is an output
 
         std::cout << "  result: "
                   << (res.converged ? "converged" : "DIVERGED")
@@ -672,7 +784,20 @@ int main(int argc, char** argv) try
                                     && (subdiv_streak < max_subdivs)
                                     && (lf_inc * 0.5 >= lf_inc_min);
 
-            if (can_subdivide) {
+            // Dissipation control: retry with half the dissipation target.
+            if (diss_on && max_subdivs > 0 && subdiv_streak < max_subdivs) {
+                u   = u_saved;
+                phi = phi_saved;
+                diss_success = 0;
+                ++subdiv_streak;
+                dtau_cur *= 0.5;
+                std::cerr << "  [adaptive] non-converged dissipation step rolled "
+                          << "back; dtau halved to " << dtau_cur
+                          << " and retrying.\n";
+                continue;
+            }
+
+            if (!diss_on && can_subdivide) {
                 // Roll u/phi back to the last converged state and retry the
                 // same lf_done with a smaller increment. history is untouched.
                 u   = u_saved;
@@ -702,6 +827,22 @@ int main(int argc, char** argv) try
         {
             // Accept: commit history, snapshot, advance lf_done, write VTK.
             pfm::updateHistory(d, u, history);
+
+            // Dissipation bookkeeping (energy balance of this step).
+            const double lf_prev   = lf_done;
+            const bool   was_diss  = diss_on;
+            double psi_new = 0.0, frac_new = 0.0, dG_step = 0.0, dB_step = 0.0;
+            if (diss_mode) {
+                const pfm::EnergyParts Ea = pfm::computeEnergy(d, u, phi);
+                psi_new  = Ea.elastic;
+                frac_new = Ea.fracture;
+                dG_step  = frac_new - gamma_n;
+                D_cum   += dG_step;
+                const double P_old = (lf_prev > 0.0) ? 2.0 * psi_n   / lf_prev : 0.0;
+                const double P_new = (lf_try  > 0.0) ? 2.0 * psi_new / lf_try  : 0.0;
+                dB_step    = 0.5 * (P_old * lf_try - P_new * lf_prev);
+                D_bal_cum += dB_step;
+            }
             u_saved   = u;
             phi_saved = phi;
             lf_done   = lf_try;
@@ -713,6 +854,61 @@ int main(int argc, char** argv) try
 
             // Force-displacement curve is logged EVERY accepted step (cheap).
             logForceDisp(step_index, lf_done, !forced_accept);
+
+            if (diss_mode) {
+                diss_csv << step_index << ','
+                         << (was_diss ? "dissipation" : "displacement") << ','
+                         << lf_done << ',' << (lf_done * u_full) << ','
+                         << (lf_done - lf_prev) << ',' << psi_new << ','
+                         << frac_new << ',' << dG_step << ',' << D_cum << ','
+                         << dB_step << ',' << D_bal_cum << ','
+                         << (was_diss ? dD_eff : 0.0) << ','
+                         << (was_diss ? dc.n_phi_solves : 0) << ','
+                         << (was_diss ? dc.n_bisect : 0) << ','
+                         << (was_diss && dc.capped ? 1 : 0) << ','
+                         << (forced_accept ? 0 : 1) << '\n';
+                diss_csv.flush();
+
+                if (was_diss) {
+                    ++diss_steps;
+                    D_target    += dtau_cur;
+                    diss_success = forced_accept ? 0 : diss_success + 1;
+                    const auto prec = std::cout.precision();
+                    std::cout << std::setprecision(8)
+                              << "  [dissipation] lambda = " << lf_done
+                              << "  (dlambda = " << (lf_done - lf_prev)
+                              << "),  dGamma = " << dG_step
+                              << " (target " << dD_eff << ")"
+                              << ",  D_cum = " << D_cum
+                              << (dc.capped ? "  [CAPPED: target not reachable "
+                                              "within dissipation_max_du]" : "")
+                              << "\n" << std::setprecision(prec);
+                    // Re-grow dtau toward the user's value after 2 successes.
+                    if (diss_success >= 2 &&
+                        dtau_cur < cfg.step.dissipation_step) {
+                        dtau_cur = std::min(2.0 * dtau_cur,
+                                            cfg.step.dissipation_step);
+                        std::cout << "  [adaptive] dtau grown to "
+                                  << dtau_cur << "\n";
+                    }
+                } else if (!diss_done && !forced_accept &&
+                           lf_prev > 0.0 && psi_new > 0.0 &&
+                           dG_step >= diss_switch) {
+                    diss_on      = true;
+                    D_target     = D_cum;
+                    dtau_cur     = cfg.step.dissipation_step;
+                    diss_success = 0;
+                    std::cout << "  [dissipation] step raised E_fracture by " << dG_step
+                              << " >= switch " << diss_switch
+                              << " -- SWITCHING TO DISSIPATION CONTROL at "
+                                 "load_factor = " << lf_done << "\n";
+                }
+                psi_n     = psi_new;
+                psi_max   = std::max(psi_max, psi_new);
+                gamma_n   = frac_new;
+                dlam_last = lf_done - lf_prev;
+                dgam_last = dG_step;
+            }
 
             // VTK snapshot only on the stride (step 0 already written before
             // the loop; the final step is guaranteed after the loop).

@@ -114,4 +114,60 @@ SolverResult solveStep(const FemInput&        d,
                        double                 load_factor,
                        const SolverSettings&  settings = SolverSettings{});
 
+// ===========================================================================
+// Dissipation-controlled staggered step (energy-release path following).
+//
+// The load factor lambda becomes an UNKNOWN of the step, fixed by requiring
+// that the crack (fracture) energy of the step grows by exactly dD:
+//
+//     g(lambda) = Gamma(phi) - Gamma_n - dD = 0,
+//     Gamma(phi) = INT Gc ( phi^2/(2 l0) + (l0/2)|grad phi|^2 ) dV   (E_fracture)
+//
+// Gamma only grows (irreversibility), so it is a valid path parameter through
+// the peak and along a snap-back, where lambda itself must decrease.
+//
+// With the hybrid (isotropic, linear) momentum balance under pure Dirichlet
+// loading, the displacement for frozen phi is exactly linear in lambda:
+// u = lambda * u_hat(phi), u_hat = solution at lambda = 1. Each sweep runs
+//   (a) u-solve with phi^k frozen at lambda = 1 -> u_hat     (1 u-solve)
+//   (b) 1-D root-find on lambda: phi = Phi(lambda u_hat) with
+//       H = max(H_n, psi+(lambda u_hat)) until Gamma(phi) - Gamma_n = dD
+//       (bracketing secant / regula falsi, a few cheap phi-solves)
+//   (c) u = lambda * u_hat, usual convergence test
+// The crack energy is pinned in EVERY sweep, so the crack cannot run away
+// past the peak; lambda drops instead (snap-back). Two cheaper variants were
+// tried first and failed in tests: a closed-form lambda from the elastic-
+// energy balance (oscillated during crack growth), and correcting lambda only
+// after the sweeps settle at fixed lambda (at the peak the staggered iteration
+// jumps to the fully-cracked branch, so the target cannot be met).
+//
+// The step converges when the usual staggered criterion holds AND
+// |g| <= tol * dD (or lambda sits on the dlambda_max cap: "capped" step).
+// ===========================================================================
+struct DissipationControl {
+    // ---- inputs ----
+    double lambda_n    = 0.0;    // load factor of the last accepted state
+    double Gamma_n     = 0.0;    // crack energy (E_fracture) of that state
+    double dD          = 0.0;    // crack-energy increase wanted in this step
+    double lambda_pred = 0.0;    // sweep-0 predictor
+    double slope       = 0.0;    // rough dGamma/dlambda (> 0), 0 = unknown
+    double dlambda_max = 0.0;    // cap on |lambda - lambda_n| (> 0)
+    double tol         = 1.0e-2; // |g| <= tol * dD
+    // ---- outputs ----
+    double lambda    = 0.0;      // load factor of the returned state
+    double dGamma    = 0.0;      // achieved crack-energy increase
+    int    n_bisect  = 0;        // sweeps that fell back to bisection
+    bool   capped    = false;    // accepted on the dlambda_max cap, |g| > tol
+    int    n_phi_solves = 0;     // phi-solves used (root-finder evaluations)
+};
+
+// Staggered scheme only (the caller must have checked settings.scheme).
+// u and phi are updated in place; on return u corresponds to dc.lambda.
+SolverResult solveStepDissipation(const FemInput&        d,
+                                  Eigen::VectorXd&       u,
+                                  Eigen::VectorXd&       phi,
+                                  const HistoryField&    history,
+                                  DissipationControl&    dc,
+                                  const SolverSettings&  settings);
+
 }  // namespace pfm

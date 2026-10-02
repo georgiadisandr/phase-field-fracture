@@ -46,6 +46,23 @@ namespace appcfg {
 //              long softening tail that does not need the peak's resolution.
 enum class StepMode { Uniform, TwoStage, ThreeStage };
 
+// What drives the load factor (orthogonal to StepMode).
+//   Displacement : the load factor follows the StepMode schedule (default,
+//                  the original behaviour).
+//   Dissipation  : dissipation-controlled path following (energy-release
+//                  arc-length, Gutierrez 2004 / Verhoosel et al. 2009). The
+//                  run starts on the StepMode schedule; once one accepted step
+//                  raises E_fracture by >= dissipation_switch, every following
+//                  step is sized so that its crack energy (E_fracture) grows
+//                  by dissipation_step (= dtau), and the load factor becomes
+//                  an UNKNOWN of the step. It can go down, which is what lets
+//                  the run follow a snap-back. Per sweep: one u-solve at
+//                  lambda = 1, then a 1-D root-find on lambda using a few
+//                  (cheap) phi-solves -- see pfm::DissipationControl.
+//                  Staggered scheme + hybrid = true + pure Dirichlet loading
+//                  only (u is then exactly linear in the load factor).
+enum class LoadControl { Displacement, Dissipation };
+
 struct StepControl {
     StepMode mode      = StepMode::Uniform;
     // Uniform mode: displacement increment (mm). <= 0 means "not set", fall
@@ -75,6 +92,27 @@ struct StepControl {
     // the crack path for the remainder of the run. The force-displacement CSV
     // carries a `converged` column so the affected steps can be identified.
     int      max_subdivs = 6;
+
+    // ---- Dissipation control (load_control = "dissipation" only) ----------
+    LoadControl load_control = LoadControl::Displacement;
+    // dtau: crack-energy increase per controlled step, same units as
+    // E_fracture (N*mm per mm thickness). REQUIRED (> 0) in dissipation mode.
+    double dissipation_step   = 0.0;
+    // Switch to dissipation control once one displacement-controlled step
+    // raises E_fracture by at least this much. <= 0 means "dissipation_step".
+    // Must be reached BEFORE the unstable jump, so set it below dtau if the
+    // switch comes too late (see the dGamma_step column of the CSV).
+    double dissipation_switch = 0.0;
+    // Cap on |change of applied displacement| per controlled step (mm).
+    // <= 0 means 10x the nominal displacement increment of the current stage.
+    // If dtau cannot be reached within the cap (e.g. elastic-like unloading
+    // or reloading), the step is accepted on the cap ("capped" in the CSV).
+    double dissipation_max_du = 0.0;
+    // Hard limit on the number of dissipation-controlled steps.
+    int    dissipation_max_steps = 100000;
+    // A controlled staggered step also requires the constraint to hold:
+    // |E_fracture - E_fracture_n - dtau| <= dissipation_tol * dtau.
+    double dissipation_tol = 1.0e-2;
 };
 
 struct AppConfig {
