@@ -202,7 +202,10 @@ struct DissipationControl {
     double lambda    = 0.0;      // load factor of the returned state
     double dGamma    = 0.0;      // achieved crack-energy increase
     int    n_bisect  = 0;        // sweeps that fell back to bisection
-    bool   capped    = false;    // accepted on the dlambda_max cap, |g| > tol
+    bool   capped    = false;    // accepted on the RELOAD cap (g < 0 at
+                                 // lambda_n + dlambda_max), |g| > tol
+    bool   unload_capped = false;// rejected: dD exceeded even at the largest
+                                 // allowed unloading -> driver halves dtau
     int    n_phi_solves = 0;     // phi-solves used (root-finder evaluations)
 };
 

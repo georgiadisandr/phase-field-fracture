@@ -501,7 +501,16 @@ SolverResult subsolvePhi(const FemInput&        d,
 // ===========================================================================
 struct DissPhiStep {
     SolverResult rp;           // phi-solve result at the returned lambda
-    bool capped = false;       // stopped on the dlambda_max cap, |g| > tol
+    // Stopped on the dlambda_max cap with |g| > tol:
+    //   +1  RELOAD cap: g < 0 at lambda_n + dlambda_max -- even the largest
+    //       allowed load increase dissipates less than dD (elastic reloading,
+    //       broken specimen). Acceptable: the step then acts like a
+    //       displacement-controlled step of size dissipation_max_du.
+    //   -1  UNLOAD cap: g > 0 at lambda_n - dlambda_max -- even the largest
+    //       allowed unloading dissipates MORE than dD. Never acceptable: the
+    //       crack would run further than the step allows. The step is
+    //       rejected and the driver halves dtau.
+    int  cap_side = 0;
     int  evals  = 0;           // phi-solves used
     int  bisect = 0;           // bisection fallbacks
 };
@@ -552,10 +561,8 @@ DissPhiStep dissipationPhiStep(const FemInput&        d,
 
     while (std::abs(gx) > gtol && out.evals < kMaxEval && out.rp.converged) {
         // On the cap with g still asking to go beyond it: target unreachable.
-        if ((gx < 0.0 && x >= lmax) || (gx > 0.0 && x <= lmin)) {
-            out.capped = true;
-            break;
-        }
+        if (gx < 0.0 && x >= lmax) { out.cap_side = +1; break; }
+        if (gx > 0.0 && x <= lmin) { out.cap_side = -1; break; }
         double c;
         if (have_lo && have_hi) {
             // regula falsi on the bracket, bisection when it hugs an end
@@ -613,6 +620,7 @@ SolverResult solveStepStaggered(const FemInput&        d,
     // equal to load_factor and nothing below changes.
     double lam       = load_factor;  // lambda that u currently corresponds to
     double slope_mem = 0.0;          // last dGamma/dlambda seen (root-finder)
+    int    unload_cap_streak = 0;    // consecutive sweeps stopped on the unload cap
     if (dc) {
         if (any_neumann)
             throw std::runtime_error(
@@ -624,6 +632,7 @@ SolverResult solveStepStaggered(const FemInput&        d,
         dc->lambda      = lam;
         dc->dGamma      = 0.0;
         dc->capped      = false;
+        dc->unload_capped = false;
         dc->n_phi_solves = 0;
     }
 
@@ -698,19 +707,37 @@ SolverResult solveStepStaggered(const FemInput&        d,
         //     lambda is chosen here so that this phi-solve meets the
         //     crack-energy target (see dissipationPhiStep).
         SolverResult rp;
-        bool         sweep_capped = false;
+        bool         sweep_capped = false;     // reload cap only (acceptable)
         int          phi_evals    = 1;
         if (dc) {
             const DissPhiStep o = dissipationPhiStep(d, u_hat, phi, history,
                                                      settings, *dc, lam, slope_mem,
                                                      phi_lower);
             rp            = o.rp;
-            sweep_capped  = o.capped;
+            sweep_capped  = (o.cap_side > 0);
+            unload_cap_streak = (o.cap_side < 0) ? unload_cap_streak + 1 : 0;
             phi_evals     = o.evals;
             u             = lam * u_hat;
             dc->lambda    = lam;
             dc->n_bisect += o.bisect;
             dc->n_phi_solves += o.evals;
+            // dD not reachable even at the largest allowed unloading, in 3
+            // sweeps in a row: the step is too large for the snap-back here.
+            // Reject it now (instead of burning max_staggered sweeps) so the
+            // driver rolls back and halves dtau.
+            if (unload_cap_streak >= 3) {
+                dc->unload_capped  = true;
+                res.iters_used     = sweep + 1;
+                res.final_residual = rp.final_residual;
+                if (sweep == 0) res.initial_residual = ru.initial_residual;
+                res.converged      = false;
+                if (settings.verbose)
+                    std::cout << "  [solver] dissipation step rejected at sweep "
+                              << sweep << ": even the largest allowed unloading "
+                                 "(dissipation_max_du) dissipates more than dD "
+                                 "-- step too large here\n";
+                return res;
+            }
         } else {
             rp = subsolvePhi(d, u, phi, history, settings, phi_lower);
         }
@@ -823,7 +850,8 @@ SolverResult solveStepStaggered(const FemInput&        d,
                           << (E.fracture - dc->Gamma_n) / dc->dD
                           << std::setprecision(prec)
                           << "   phi-solves = " << phi_evals
-                          << (sweep_capped ? " [cap]" : "");
+                          << (sweep_capped ? " [reload cap]"
+                              : unload_cap_streak > 0 ? " [UNLOAD cap]" : "");
             }
             std::cout << "   (u: " << ru.iters_used << " Newton it"
                       << (ru.converged ? "" : ", NOT conv")
@@ -846,6 +874,8 @@ SolverResult solveStepStaggered(const FemInput&        d,
         }
         // Dissipation control: the crack-energy constraint must hold too (it
         // does by construction unless the root-finder hit the step cap).
+        // Only the RELOAD cap may be accepted with |g| > tol (sweep_capped);
+        // an unload-capped sweep can never converge here.
         if (dc) {
             const double g    = E.fracture - dc->Gamma_n - dc->dD;
             const bool   g_ok = std::abs(g) <= dc->tol * dc->dD;
