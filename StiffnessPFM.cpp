@@ -241,7 +241,7 @@ void extractElement(const std::vector<int>& nodes,
 // version did), so the symbolic factorization stays valid for the whole run.
 // ---------------------------------------------------------------------------
 struct PatternCache {
-    Eigen::SparseMatrix<double> pattern;   // structure, all values 0
+    Eigen::SparseMatrix<double> pattern;   // structure, reused every assembly
     std::vector<int>            slots;     // element entry -> coefficient index
     std::vector<std::size_t>    off;       // element -> offset into 'slots'
     const FemInput*             owner = nullptr;
@@ -559,17 +559,16 @@ assembleU_System(const FemInput&        d,
     if (static_cast<int>(history.size()) != d.nelem)
         throw std::runtime_error("assembleU_System: history size != nelem");
 
-    USystem sys;
-    sys.R = Eigen::VectorXd::Zero(total);
-
-    // Reuse the cached sparsity pattern: copying it gives a compressed matrix
-    // with the right structure and all-zero values, ready to be refilled.
+    // The matrix itself is allocated once and reused: zeroing its values is
+    // all the "sparse build" this needs now.
     static PatternCache cache;
     {
         prof::Scope _t(prof::SparseBuild);
         if (!cache.built || cache.owner != &d) buildPattern(d, /*u_block=*/true, cache);
-        sys.K = cache.pattern;
+        else                                   cache.pattern.coeffs().setZero();
     }
+
+    USystem sys{cache.pattern, Eigen::VectorXd::Zero(total)};
     double* vals = sys.K.valuePtr();
 
     std::vector<int> nodes;
@@ -619,15 +618,14 @@ assemblePhi_System(const FemInput&        d,
     if (static_cast<int>(history.size()) != d.nelem)
         throw std::runtime_error("assemblePhi_System: history size != nelem");
 
-    PhiSystem sys;
-    sys.R = Eigen::VectorXd::Zero(npoin);
-
     static PatternCache cache;
     {
         prof::Scope _t(prof::SparseBuild);
         if (!cache.built || cache.owner != &d) buildPattern(d, /*u_block=*/false, cache);
-        sys.K = cache.pattern;
+        else                                   cache.pattern.coeffs().setZero();
     }
+
+    PhiSystem sys{cache.pattern, Eigen::VectorXd::Zero(npoin)};
     double* vals = sys.K.valuePtr();
 
     std::vector<int> nodes;

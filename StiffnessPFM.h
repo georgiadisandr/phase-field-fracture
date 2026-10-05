@@ -116,15 +116,25 @@ assembleGlobalSystem(const FemInput&        d,
 // ===========================================================================
 
 // Assembled global system for the displacement sub-problem (size 2*npoin).
+//
+// K is a REFERENCE to a matrix the assembler owns and reuses for the whole
+// run: its sparsity pattern is allocated once and only the values are
+// refilled (and then modified in place by applyDirichlet). Allocating a fresh
+// 10-MB matrix per assembly cost more than the assembly itself, mostly in
+// first-touch page faults. Consequences for callers:
+//   * the reference stays valid, but its contents are overwritten by the NEXT
+//     call to assembleU_System -- consume (or copy) it before reassembling;
+//   * it is not thread-safe: one assembly at a time.
 struct USystem {
-    Eigen::SparseMatrix<double> K;   // (2*npoin) x (2*npoin)
-    Eigen::VectorXd             R;   // length 2*npoin
+    Eigen::SparseMatrix<double>& K;   // (2*npoin) x (2*npoin), assembler-owned
+    Eigen::VectorXd              R;   // length 2*npoin
 };
 
 // Assembled global system for the phase-field sub-problem (size npoin).
+// Same ownership rules as USystem above.
 struct PhiSystem {
-    Eigen::SparseMatrix<double> K;   // npoin x npoin
-    Eigen::VectorXd             R;   // length npoin
+    Eigen::SparseMatrix<double>& K;   // npoin x npoin, assembler-owned
+    Eigen::VectorXd              R;   // length npoin
 };
 
 // Element-level U sub-problem (phi enters as a parameter via g(phi)).
