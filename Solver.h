@@ -59,6 +59,36 @@ enum class StaggerStop {
     EnergyGamma
 };
 
+// How the box constraint  phi_n <= phi <= 1  is enforced in the staggered
+// phase-field sub-solve (phi_n = phase field of the last ACCEPTED step).
+//
+//   None      -- not enforced (original behaviour). With AT2 + the history
+//                field phi stays in [0,1] on its own and does not heal.
+//   ActiveSet -- primal-dual active set (Hintermueller, Ito & Kunisch 2002;
+//                for phase-field fracture: Heister, Wheeler & Wick 2015).
+//                The phi-problem is affine for frozen u, so:
+//                  1. solve with the current fixed (active) set
+//                  2. residual R = K phi - f of the UNMODIFIED system
+//                  3. fix free nodes outside [phi_n, 1] at the violated
+//                     bound; release fixed nodes whose R has the wrong sign
+//                     (lower bound: release if R < 0, upper: if R > 0)
+//                  4. repeat until the set no longer changes
+//                Fixed nodes are imposed exactly like Dirichlet DOFs, so the
+//                sparsity pattern (and the symbolic factorisation) is reused.
+//                Staggered scheme only.
+enum class PhiBounds { None, ActiveSet };
+
+// What prevents the crack from healing.
+//
+//   History -- phi is driven by H = max(H_n, psi+) (Miehe 2010); the driver
+//              raises H after every accepted step. Original behaviour.
+//   Bounds  -- phi is driven by psi+ directly (H is never raised, so
+//              max(0, psi+) = psi+), and irreversibility comes ONLY from the
+//              lower bound phi >= phi_n. Requires PhiBounds::ActiveSet.
+//              Variationally cleaner; the setting needed for formulations
+//              that do not keep phi in range on their own (AT1, PF-CZM).
+enum class Irreversibility { History, Bounds };
+
 struct SolverSettings {
     // A Newton (sub-)solve terminates when ||R|| < max(tol_abs, tol_rel*||R0||).
     double tol_rel  = 1.0e-5;
@@ -88,6 +118,15 @@ struct SolverSettings {
     // load_factor to recover the {E^k} sequence of a single step and reproduce
     // Ambati Fig. 4/6. Empty (default) disables the log.
     std::string energy_csv;
+
+    // Box constraint phi_n <= phi <= 1 in the phi sub-solve (see PhiBounds).
+    PhiBounds       phi_bounds      = PhiBounds::None;
+    // Healing prevention (see Irreversibility). Read by the driver.
+    Irreversibility irreversibility = Irreversibility::History;
+    // Active set: max passes (solve / update set) per phi-solve. The phi
+    // problem is linear, so 2-5 passes are typical; hitting this limit marks
+    // the phi-solve as not converged.
+    int phi_active_set_max_iter = 50;
 };
 
 struct SolverResult {
@@ -96,6 +135,9 @@ struct SolverResult {
     double final_residual = 0.0;   // ||R|| at exit
     double initial_residual = 0.0; // ||R|| at the first iteration / sweep
     bool   converged      = false;
+    // Active-set phi-solve only: nodes held at phi_n / at 1 on exit.
+    int    n_at_lower     = 0;
+    int    n_at_upper     = 0;
 };
 
 // Run one quasi-static step at load_factor * (prescribed BC values), updating
@@ -112,7 +154,10 @@ SolverResult solveStep(const FemInput&        d,
                        Eigen::VectorXd&       phi,
                        const HistoryField&    history,
                        double                 load_factor,
-                       const SolverSettings&  settings = SolverSettings{});
+                       const SolverSettings&  settings = SolverSettings{},
+                       const Eigen::VectorXd* phi_lower = nullptr);
+// phi_lower: the lower bound phi_n for PhiBounds::ActiveSet -- the phase field
+// of the last ACCEPTED step (not of the previous sweep). nullptr = 0.
 
 // ===========================================================================
 // Dissipation-controlled staggered step (energy-release path following).
@@ -168,6 +213,7 @@ SolverResult solveStepDissipation(const FemInput&        d,
                                   Eigen::VectorXd&       phi,
                                   const HistoryField&    history,
                                   DissipationControl&    dc,
-                                  const SolverSettings&  settings);
+                                  const SolverSettings&  settings,
+                                  const Eigen::VectorXd* phi_lower = nullptr);
 
 }  // namespace pfm

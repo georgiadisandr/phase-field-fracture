@@ -598,6 +598,15 @@ int main(int argc, char** argv) try
     // update. The released energy from the external energy balance
     //     dD_bal = 1/2 ( P_n lambda_{n+1} - P_{n+1} lambda_n ),  P = 2 Psi_el/lambda
     // is logged alongside, as a cross-check.
+    if (cfg.solver.phi_bounds == pfm::PhiBounds::ActiveSet)
+        std::cout << "[phi] box constraint phi_n <= phi <= 1 by ACTIVE SET "
+                     "(max " << cfg.solver.phi_active_set_max_iter
+                  << " passes per phi-solve); irreversibility = "
+                  << (cfg.solver.irreversibility == pfm::Irreversibility::Bounds
+                          ? "bounds (phi driven by psi+, history not raised)"
+                          : "history field H")
+                  << "\n";
+
     const bool diss_mode =
         (cfg.step.load_control == appcfg::LoadControl::Dissipation);
     bool   diss_on      = false;  // currently under dissipation control
@@ -754,8 +763,10 @@ int main(int argc, char** argv) try
         const prof::Registry prof_before = prof::reg();
 
         const pfm::SolverResult res =
-            diss_on ? pfm::solveStepDissipation(d, u, phi, history, dc, cfg.solver)
-                    : pfm::solveStep(d, u, phi, history, lf_try, cfg.solver);
+            diss_on ? pfm::solveStepDissipation(d, u, phi, history, dc, cfg.solver,
+                                                &phi_saved)
+                    : pfm::solveStep(d, u, phi, history, lf_try, cfg.solver,
+                                     &phi_saved);
         if (diss_on) lf_try = dc.lambda;   // the step's load factor is an output
 
         std::cout << "  result: "
@@ -826,7 +837,11 @@ int main(int argc, char** argv) try
 
         {
             // Accept: commit history, snapshot, advance lf_done, write VTK.
-            pfm::updateHistory(d, u, history);
+            // irreversibility = "bounds": H is never raised (stays 0), so the
+            // phase field is driven by psi+ itself and healing is prevented
+            // only by the lower bound phi >= phi_n (phi_saved, below).
+            if (cfg.solver.irreversibility == pfm::Irreversibility::History)
+                pfm::updateHistory(d, u, history);
 
             // Dissipation bookkeeping (energy balance of this step).
             const double lf_prev   = lf_done;

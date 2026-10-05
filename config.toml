@@ -248,6 +248,34 @@ max_staggered = 2      # used only when scheme = "staggered"
 stagger_stop          = "energy"
 stagger_gamma_tol_deg = 10.0    # Ambati's suggested ~10 deg (energy criterion only)
 
+# Box constraint on the phase field, phi_n <= phi <= 1 (staggered only).
+# phi_n is the phase field of the last ACCEPTED load step.
+#
+#   phi_bounds = "none"        not enforced (original behaviour; with AT2 +
+#                              the history field phi stays in range anyway).
+#              = "active_set"  primal-dual active set in every phi-solve:
+#                              solve -> fix nodes outside [phi_n, 1] at the
+#                              violated bound -> release fixed nodes whose
+#                              residual R = K phi - f has the wrong sign
+#                              (lower: R < 0, upper: R > 0) -> repeat until
+#                              the set stops changing. Exact; fixed nodes are
+#                              handled like Dirichlet DOFs. Typically 1-4
+#                              passes per phi-solve (warm-started).
+#
+#   irreversibility = "history"  phi driven by H = max(H_n, psi+) (original).
+#                   = "bounds"   phi driven by psi+ directly (H is never
+#                                raised); healing is prevented ONLY by
+#                                phi >= phi_n. Needs phi_bounds = "active_set".
+#                                The setting for formulations that do not keep
+#                                phi in range on their own (AT1, PF-CZM).
+#
+#   phi_active_set_max_iter -- max passes per phi-solve (not settling within
+#                              it marks the phi-solve, and the step, as not
+#                              converged).
+phi_bounds              = "none"      # "none" or "active_set"
+irreversibility         = "history"   # "history" or "bounds"
+phi_active_set_max_iter = 50
+
 
 
 # -----------------------------------------------------------------------------

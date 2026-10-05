@@ -294,16 +294,153 @@ SolverResult subsolveU(const FemInput&        d,
     return res;
 }
 
+// ---------------------------------------------------------------------------
+// Phase-field sub-solve with the box constraint  lo <= phi <= 1  (lo = phi_n)
+// by the primal-dual active set method. See PhiBounds in Solver.h.
+//
+// With u frozen the phi residual is AFFINE in phi:  R(x) = R0 + K (x - phi0)
+// with K constant (H_eff = max(H, psi+(u)) does not depend on phi), so the
+// system is assembled ONCE and every pass is one factorisation + solve.
+//
+// Fixed nodes are imposed like Dirichlet DOFs, in place (identity row and
+// column, prescribed increment moved to the right-hand side), on a copy of
+// the assembled matrix -- the sparsity pattern is unchanged, so the once-only
+// symbolic analysis is reused for every pass.
+//
+// The active set is warm-started from the previous call: between staggered
+// sweeps (and load steps) it barely changes, so most calls settle in 1-2
+// passes. The update rule corrects any stale entry.
+// ---------------------------------------------------------------------------
+// Active-set state per node, kept between calls (warm start) and read by the
+// staggered sweep: 0 free, -1 held at the lower bound phi_n, +1 held at 1.
+std::vector<signed char> g_phi_active;
+
+SolverResult subsolvePhiActiveSet(const FemInput&        d,
+                                  const Eigen::VectorXd& u,
+                                  Eigen::VectorXd&       phi,
+                                  const HistoryField&    history,
+                                  const SolverSettings&  settings,
+                                  const Eigen::VectorXd* phi_lower)
+{
+    const int n = d.npoin;
+    SolverResult res;
+
+    static SpLDLT ldltA;
+    static bool   ldltA_analyzed = false;
+    std::vector<signed char>& state = g_phi_active;
+    if (static_cast<int>(state.size()) != n) state.assign(n, 0);
+
+    PhiSystem sys = assemblePhi_System(d, u, phi, history);
+    const Eigen::SparseMatrix<double> K0   = sys.K;   // assembler-owned: copy
+    const Eigen::VectorXd             R0   = sys.R;
+    const Eigen::VectorXd             phi0 = phi;
+    res.initial_residual = R0.norm();
+
+    // Bounds: lo = clamp(phi_n, 0, 1), hi = 1.
+    Eigen::VectorXd lo = Eigen::VectorXd::Zero(n);
+    if (phi_lower) {
+        if (phi_lower->size() != n)
+            throw std::runtime_error("subsolvePhiActiveSet: phi_lower size != npoin");
+        lo = phi_lower->cwiseMax(0.0).cwiseMin(1.0);
+    }
+    const double hi = 1.0;
+
+    // Tolerances: x in phi units; R relative to the stiffness scale (R for a
+    // unit change of phi at one node is ~ the diagonal of K).
+    double kmax = 0.0;
+    for (int j = 0; j < K0.outerSize(); ++j)
+        for (Eigen::SparseMatrix<double>::InnerIterator it(K0, j); it; ++it)
+            if (it.row() == it.col()) kmax = std::max(kmax, std::abs(it.value()));
+    const double tol_x = 1e-12;
+    const double tol_R = 1e-12 * std::max(kmax, 1e-300);
+
+    Eigen::SparseMatrix<double> K;
+    Eigen::VectorXd x = phi0, Rx = R0, rhs, dfix(n);
+    std::vector<char> mask(n);
+    bool settled = false;
+    int  pass    = 0;
+
+    for (pass = 0; pass < settings.phi_active_set_max_iter; ++pass) {
+        // Fixed values: increment that puts each fixed node on its bound.
+        for (int i = 0; i < n; ++i) {
+            mask[i] = (state[i] != 0);
+            dfix(i) = (state[i] < 0) ? lo(i) - phi0(i)
+                    : (state[i] > 0) ? hi    - phi0(i) : 0.0;
+        }
+        // K delta = -R0 with the fixed DOFs eliminated in place.
+        K   = K0;
+        rhs = -R0;
+        for (int j = 0; j < K.outerSize(); ++j) {
+            const bool jc = mask[j] != 0;
+            for (Eigen::SparseMatrix<double>::InnerIterator it(K, j); it; ++it) {
+                const int i = static_cast<int>(it.row());
+                if (jc) {
+                    if (i == j) { it.valueRef() = 1.0; continue; }
+                    if (!mask[i]) rhs(i) -= it.value() * dfix(j);
+                    it.valueRef() = 0.0;
+                } else if (mask[i]) {
+                    it.valueRef() = 0.0;
+                }
+            }
+        }
+        for (int i = 0; i < n; ++i) if (mask[i]) rhs(i) = dfix(i);
+
+        const Eigen::VectorXd delta =
+            factorizeAndSolve(ldltA, ldltA_analyzed, K, rhs, "subsolvePhi(active set)");
+        x  = phi0 + delta;
+        for (int i = 0; i < n; ++i)               // exact bound values
+            if (state[i] < 0) x(i) = lo(i); else if (state[i] > 0) x(i) = hi;
+        Rx = R0 + K0 * (x - phi0);                // residual of the ORIGINAL system
+
+        // Update the whole set at once.
+        bool changed = false;
+        for (int i = 0; i < n; ++i) {
+            signed char ns = state[i];
+            if (state[i] == 0) {
+                if      (x(i) < lo(i) - tol_x) ns = -1;
+                else if (x(i) > hi    + tol_x) ns = +1;
+            } else if (state[i] < 0) {
+                if (Rx(i) < -tol_R) ns = 0;       // equations want phi higher
+            } else {
+                if (Rx(i) >  tol_R) ns = 0;       // equations want phi lower
+            }
+            if (ns != state[i]) { state[i] = ns; changed = true; }
+        }
+        if (!changed) { settled = true; ++pass; break; }
+    }
+
+    phi = x;
+    double r2 = 0.0;
+    for (int i = 0; i < n; ++i) {
+        if (state[i] == 0) r2 += Rx(i) * Rx(i);
+        else if (state[i] < 0) ++res.n_at_lower;
+        else ++res.n_at_upper;
+    }
+    res.iters_used     = pass;                    // active-set passes
+    res.final_residual = std::sqrt(r2);           // free-node residual
+    res.converged      = settled;
+    if (!settled && settings.verbose)
+        std::cout << "  [phi-bounds] active set did not settle in "
+                  << settings.phi_active_set_max_iter << " passes\n";
+    return res;
+}
+
 // Newton sub-solve of the PHASE-FIELD block with u held fixed.
 // With u (hence psi^+ and the history H) frozen the phase-field residual is
 // affine in phi, so this converges in a single iteration; the loop is kept
 // generic for robustness. The u-block is frozen (identity).
+// With settings.phi_bounds == ActiveSet the box-constrained solve above is
+// used instead.
 SolverResult subsolvePhi(const FemInput&        d,
                          const Eigen::VectorXd& u,
                          Eigen::VectorXd&       phi,
                          const HistoryField&    history,
-                         const SolverSettings&  settings)
+                         const SolverSettings&  settings,
+                         const Eigen::VectorXd* phi_lower = nullptr)
 {
+    if (settings.phi_bounds == PhiBounds::ActiveSet)
+        return subsolvePhiActiveSet(d, u, phi, history, settings, phi_lower);
+
     SolverResult res;
     double R0 = -1.0;
 
@@ -376,7 +513,8 @@ DissPhiStep dissipationPhiStep(const FemInput&        d,
                                const SolverSettings&  settings,
                                const DissipationControl& dc,
                                double&                lam,
-                               double&                slope_mem)
+                               double&                slope_mem,
+                               const Eigen::VectorXd* phi_lower)
 {
     const double lmax = dc.lambda_n + dc.dlambda_max;
     const double lmin = std::max(dc.lambda_n - dc.dlambda_max, 0.05 * dc.lambda_n);
@@ -393,7 +531,7 @@ DissPhiStep dissipationPhiStep(const FemInput&        d,
     const auto eval   = [&](double L) {
         ph = phi0;
         ut = L * u_hat;
-        out.rp = subsolvePhi(d, ut, ph, history, settings);
+        out.rp = subsolvePhi(d, ut, ph, history, settings, phi_lower);
         ++out.evals;
         return computeEnergy(d, ut, ph).fracture - dc.Gamma_n - dc.dD;
     };
@@ -459,7 +597,8 @@ SolverResult solveStepStaggered(const FemInput&        d,
                                 const HistoryField&    history,
                                 double                 load_factor,
                                 const SolverSettings&  settings,
-                                DissipationControl*    dc = nullptr)
+                                DissipationControl*    dc = nullptr,
+                                const Eigen::VectorXd* phi_lower = nullptr)
 {
     const int npoin = d.npoin;
     const int n_u   = 2 * npoin;
@@ -563,7 +702,8 @@ SolverResult solveStepStaggered(const FemInput&        d,
         int          phi_evals    = 1;
         if (dc) {
             const DissPhiStep o = dissipationPhiStep(d, u_hat, phi, history,
-                                                     settings, *dc, lam, slope_mem);
+                                                     settings, *dc, lam, slope_mem,
+                                                     phi_lower);
             rp            = o.rp;
             sweep_capped  = o.capped;
             phi_evals     = o.evals;
@@ -572,7 +712,7 @@ SolverResult solveStepStaggered(const FemInput&        d,
             dc->n_bisect += o.bisect;
             dc->n_phi_solves += o.evals;
         } else {
-            rp = subsolvePhi(d, u, phi, history, settings);
+            rp = subsolvePhi(d, u, phi, history, settings, phi_lower);
         }
 
         // The phi sub-problem is nearly affine, so failure here is rare --
@@ -596,6 +736,13 @@ SolverResult solveStepStaggered(const FemInput&        d,
         if (any_neumann)
             R.head(n_u).noalias() -= load_factor * F_ext;
         zeroReactions(R, d);
+        // Nodes held at a phi bound carry the constraint's reaction (the
+        // Lagrange multiplier) in their residual, by design -- exclude them
+        // from the convergence norm exactly like Dirichlet reactions.
+        if (settings.phi_bounds == PhiBounds::ActiveSet &&
+            static_cast<int>(g_phi_active.size()) == npoin)
+            for (int i = 0; i < npoin; ++i)
+                if (g_phi_active[i] != 0) R(n_u + i) = 0.0;
         const double Rn = R.norm();
 
         if (sweep == 0) {
@@ -680,9 +827,14 @@ SolverResult solveStepStaggered(const FemInput&        d,
             }
             std::cout << "   (u: " << ru.iters_used << " Newton it"
                       << (ru.converged ? "" : ", NOT conv")
-                      << ";  phi: " << rp.iters_used << " it"
-                      << (rp.converged ? "" : ", NOT conv")
-                      << ")\n";
+                      << ";  phi: " << rp.iters_used
+                      << (settings.phi_bounds == PhiBounds::ActiveSet
+                              ? " active-set passes" : " it")
+                      << (rp.converged ? "" : ", NOT conv");
+            if (settings.phi_bounds == PhiBounds::ActiveSet)
+                std::cout << ";  at phi_n: " << rp.n_at_lower
+                          << ", at 1: " << rp.n_at_upper;
+            std::cout << ")\n";
         }
 
         bool converged;
@@ -731,7 +883,8 @@ SolverResult solveStep(const FemInput&        d,
                        Eigen::VectorXd&       phi,
                        const HistoryField&    history,
                        double                 load_factor,
-                       const SolverSettings&  settings)
+                       const SolverSettings&  settings,
+                       const Eigen::VectorXd* phi_lower)
 {
     const int npoin = d.npoin;
     if (u.size()   != 2 * npoin)
@@ -740,7 +893,11 @@ SolverResult solveStep(const FemInput&        d,
         throw std::runtime_error("solveStep: phi size != npoin");
 
     if (settings.scheme == SolverScheme::Staggered)
-        return solveStepStaggered(d, u, phi, history, load_factor, settings);
+        return solveStepStaggered(d, u, phi, history, load_factor, settings,
+                                  nullptr, phi_lower);
+    if (settings.phi_bounds != PhiBounds::None)
+        throw std::runtime_error(
+            "solveStep: phi bounds (active set) need the staggered scheme");
     return solveStepMonolithic(d, u, phi, history, load_factor, settings);
 }
 
@@ -749,7 +906,8 @@ SolverResult solveStepDissipation(const FemInput&        d,
                                   Eigen::VectorXd&       phi,
                                   const HistoryField&    history,
                                   DissipationControl&    dc,
-                                  const SolverSettings&  settings)
+                                  const SolverSettings&  settings,
+                                  const Eigen::VectorXd* phi_lower)
 {
     const int npoin = d.npoin;
     if (u.size()   != 2 * npoin)
@@ -766,7 +924,8 @@ SolverResult solveStepDissipation(const FemInput&        d,
         throw std::runtime_error(
             "solveStepDissipation: needs lambda_n > 0, dD > 0 and "
             "dlambda_max > 0");
-    return solveStepStaggered(d, u, phi, history, dc.lambda_pred, settings, &dc);
+    return solveStepStaggered(d, u, phi, history, dc.lambda_pred, settings, &dc,
+                              phi_lower);
 }
 
 }  // namespace pfm

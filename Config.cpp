@@ -342,6 +342,36 @@ void loadSolverSection(const toml::table& root, pfm::SolverSettings& s)
     }
 
     readDouble(*tbl, "stagger_gamma_tol_deg", s.stagger_gamma_tol_deg);
+
+    // Box constraint on phi: "none" (default) or "active_set".
+    std::string pb;
+    if (readString(*tbl, "phi_bounds", pb)) {
+        for (auto& c : pb) c = static_cast<char>(std::tolower(c));
+        if (pb == "none")
+            s.phi_bounds = pfm::PhiBounds::None;
+        else if (pb == "active_set" || pb == "activeset" || pb == "active-set")
+            s.phi_bounds = pfm::PhiBounds::ActiveSet;
+        else
+            throw std::runtime_error(
+                "solver.phi_bounds must be \"none\" or \"active_set\" "
+                "(got \"" + pb + "\")");
+    }
+    // Healing prevention: "history" (default) or "bounds".
+    std::string ir;
+    if (readString(*tbl, "irreversibility", ir)) {
+        for (auto& c : ir) c = static_cast<char>(std::tolower(c));
+        if (ir == "history")
+            s.irreversibility = pfm::Irreversibility::History;
+        else if (ir == "bounds")
+            s.irreversibility = pfm::Irreversibility::Bounds;
+        else
+            throw std::runtime_error(
+                "solver.irreversibility must be \"history\" or \"bounds\" "
+                "(got \"" + ir + "\")");
+    }
+    int64_t asi = 0;
+    if (readScalar<int64_t>(*tbl, "phi_active_set_max_iter", asi))
+        s.phi_active_set_max_iter = static_cast<int>(asi);
 }
 
 void loadRunSection(const toml::table& root, AppConfig& cfg)
@@ -602,6 +632,19 @@ void validate(const AppConfig& cfg)
         if (cfg.step.dissipation_tol <= 0.0)
             throw std::invalid_argument("run.dissipation_tol must be > 0");
     }
+    if (cfg.solver.phi_bounds != pfm::PhiBounds::None &&
+        cfg.solver.scheme != pfm::SolverScheme::Staggered)
+        throw std::invalid_argument(
+            "solver.phi_bounds = \"active_set\" is implemented for "
+            "solver.scheme = \"staggered\" only");
+    if (cfg.solver.irreversibility == pfm::Irreversibility::Bounds &&
+        cfg.solver.phi_bounds == pfm::PhiBounds::None)
+        throw std::invalid_argument(
+            "solver.irreversibility = \"bounds\" needs solver.phi_bounds = "
+            "\"active_set\" -- otherwise nothing prevents the crack from "
+            "healing");
+    if (cfg.solver.phi_active_set_max_iter <= 0)
+        throw std::invalid_argument("solver.phi_active_set_max_iter must be > 0");
     if (cfg.solver.max_iter <= 0)
         throw std::invalid_argument("solver.max_iter must be > 0");
     if (cfg.solver.tol_rel <= 0.0 || cfg.solver.tol_abs <= 0.0)
