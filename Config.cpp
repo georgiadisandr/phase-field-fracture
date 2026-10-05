@@ -150,6 +150,18 @@ void loadFemSection(const toml::table& root, fem::FemSpec& spec)
         // above: `energy_split` still selects which psi^+ drives the phase
         // field; `hybrid` only makes the momentum balance isotropic.
         readScalar(*tbl, "hybrid", spec.hybrid);
+
+        // Crack-surface density model: "AT2" (default) or "AT1".
+        std::string cm;
+        if (readString(*tbl, "crack_model", cm)) {
+            for (auto& c : cm) c = static_cast<char>(std::toupper(c));
+            if      (cm == "AT2") spec.crack_model = pfm::CrackModel::AT2;
+            else if (cm == "AT1") spec.crack_model = pfm::CrackModel::AT1;
+            else
+                throw std::runtime_error(
+                    "fem.crack_model must be \"AT2\" or \"AT1\" (got \""
+                    + cm + "\")");
+        }
     }
 
     std::unordered_map<std::string, int> name_to_index;
@@ -476,6 +488,15 @@ AppConfig loadConfigFromToml(const std::string& path)
     loadSolverSection(root, cfg.solver);
     loadRunSection   (root, cfg);
 
+    // AT1 does not keep phi >= 0 on its own (below its elastic threshold the
+    // unconstrained phi-solve gives phi < 0), so the bound is mandatory:
+    // switch the active set on automatically if the user did not.
+    if (cfg.fem.crack_model == pfm::CrackModel::AT1 &&
+        cfg.solver.phi_bounds == pfm::PhiBounds::None) {
+        cfg.solver.phi_bounds        = pfm::PhiBounds::ActiveSet;
+        cfg.phi_bounds_auto_for_at1  = true;
+    }
+
     return cfg;
 }
 
@@ -632,6 +653,12 @@ void validate(const AppConfig& cfg)
         if (cfg.step.dissipation_tol <= 0.0)
             throw std::invalid_argument("run.dissipation_tol must be > 0");
     }
+    if (cfg.fem.crack_model == pfm::CrackModel::AT1 &&
+        cfg.solver.scheme != pfm::SolverScheme::Staggered)
+        throw std::invalid_argument(
+            "fem.crack_model = \"AT1\" needs solver.scheme = \"staggered\" "
+            "(AT1 requires the bound phi >= 0, enforced by the staggered "
+            "phi active set)");
     if (cfg.solver.phi_bounds != pfm::PhiBounds::None &&
         cfg.solver.scheme != pfm::SolverScheme::Staggered)
         throw std::invalid_argument(

@@ -24,6 +24,50 @@ namespace pfm {
 double degradation(double phi, double k);
 
 // ---------------------------------------------------------------------------
+// Crack-surface density model (TOML key fem.crack_model). Both models use the
+// same degradation g(phi) above; they differ in the local term w(phi) of the
+// regularised crack energy  Gamma = Gc/c_w INT ( w(phi)/l0 + l0 |grad phi|^2 ):
+//
+//   AT2 (default): w = phi^2, c_w = 2    -> Gc ( phi^2/(2 l0) + l0/2 |grad phi|^2 )
+//                  Damage starts at any load (no elastic phase); phi stays in
+//                  [0,1] on its own.
+//   AT1          : w = phi,   c_w = 8/3  -> 3Gc/8 ( phi/l0 + l0 |grad phi|^2 )
+//                  Linear-elastic until psi+ reaches 3 Gc/(16 l0); needs the
+//                  bound phi >= 0 (enforced by the phi active set).
+// ---------------------------------------------------------------------------
+enum class CrackModel { AT2, AT1 };
+
+// Gauss-point coefficients of the crack-energy part of the phi equation and
+// of the crack energy itself, for the current model:
+//   residual :  r_phi += local_R * N + grad * Bphi^T grad(phi)
+//   tangent  :  K_phiphi += local_K * N N^T + grad * Bphi^T Bphi
+//   energy   :  gamma = energy_local + energy_grad * |grad phi|^2
+// (The driving term -2(1-phi) H and its tangent 2H N N^T are added by the
+//  caller -- they are the same for both models.)
+struct CrackTerms {
+    double local_R;
+    double local_K;
+    double grad;
+    double energy_local;
+    double energy_grad;
+};
+
+inline CrackTerms crackTerms(CrackModel m, double Gc, double l0, double phi)
+{
+    if (m == CrackModel::AT1)
+        return { 3.0 * Gc / (8.0 * l0),           // d/dphi of 3Gc/(8 l0) phi
+                 0.0,
+                 0.75 * Gc * l0,                  // 2 * 3Gc l0 / 8
+                 3.0 * Gc * phi / (8.0 * l0),
+                 0.375 * Gc * l0 };
+    return { Gc / l0 * phi,                       // AT2
+             Gc / l0,
+             Gc * l0,
+             Gc * phi * phi / (2.0 * l0),
+             0.5 * Gc * l0 };
+}
+
+// ---------------------------------------------------------------------------
 // Strain-energy split model. Selected per run via the TOML key
 // `fem.energy_split`.
 // ---------------------------------------------------------------------------

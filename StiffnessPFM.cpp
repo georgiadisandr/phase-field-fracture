@@ -140,11 +140,13 @@ void elementSystem(const std::vector<int>&    nodes,
         const Eigen::Vector3d sigma_eff = g_phi * sp.sigma_plus + sp.sigma_minus;
         R_u += (Bu.transpose() * sigma_eff) * dV;
 
-        // R_phi : N (Gc/l0 phi - 2(1-phi) H) + Gc l0 Bphi^T grad(phi).
-        const double n_scalar = mp.Gc / mp.l0 * phi_g
+        // R_phi : N (local(phi) - 2(1-phi) H) + grad Bphi^T grad(phi);
+        // AT2: local = Gc/l0 phi, grad = Gc l0 (see crackTerms).
+        const CrackTerms ct = crackTerms(d.crack_model, mp.Gc, mp.l0, phi_g);
+        const double n_scalar = ct.local_R
                               - 2.0 * (1.0 - phi_g) * H_eff;
         R_phi += (n_scalar * N) * dV;
-        R_phi += (mp.Gc * mp.l0) * (Bphi.transpose() * grad_phi) * dV;
+        R_phi += ct.grad * (Bphi.transpose() * grad_phi) * dV;
 
         // ---- tangent (only if requested) ----
         if (want_K) {
@@ -168,9 +170,9 @@ void elementSystem(const std::vector<int>&    nodes,
             K_uphi += (-2.0 * (1.0 - phi_g)) * (BtSp  * N.transpose()) * dV;
             K_phiu += (-2.0 * (1.0 - phi_g)) * (N * BtSps.transpose()) * dV;
 
-            // K_phiphi : Gc l0 Bphi^T Bphi + (Gc/l0 + 2 H) N N^T.
-            K_phiphi += (mp.Gc * mp.l0) * (Bphi.transpose() * Bphi) * dV;
-            K_phiphi += (mp.Gc / mp.l0 + 2.0 * H_eff)
+            // K_phiphi : grad Bphi^T Bphi + (local_K + 2 H) N N^T.
+            K_phiphi += ct.grad * (Bphi.transpose() * Bphi) * dV;
+            K_phiphi += (ct.local_K + 2.0 * H_eff)
                         * (N * N.transpose()) * dV;
         }
     }
@@ -522,14 +524,16 @@ void elementPhiSystem(const std::vector<int>&    nodes,
 
         const double H_eff = std::max(H_elem[g], sp.psi_plus);
 
-        const double n_scalar = mp.Gc / mp.l0 * phi_g
+        // Crack-energy part depends on fem.crack_model (AT2 / AT1).
+        const CrackTerms ct = crackTerms(d.crack_model, mp.Gc, mp.l0, phi_g);
+        const double n_scalar = ct.local_R
                               - 2.0 * (1.0 - phi_g) * H_eff;
         R_phi += (n_scalar * N) * dV;
-        R_phi += (mp.Gc * mp.l0) * (Bphi.transpose() * grad_phi) * dV;
+        R_phi += ct.grad * (Bphi.transpose() * grad_phi) * dV;
 
         if (want_K) {
-            K_phiphi += (mp.Gc * mp.l0) * (Bphi.transpose() * Bphi) * dV;
-            K_phiphi += (mp.Gc / mp.l0 + 2.0 * H_eff)
+            K_phiphi += ct.grad * (Bphi.transpose() * Bphi) * dV;
+            K_phiphi += (ct.local_K + 2.0 * H_eff)
                         * (N * N.transpose()) * dV;
         }
     }
@@ -852,8 +856,11 @@ computeEnergy(const FemInput&        d,
             // criterion would lose its monotonicity.
             E.elastic  += (d.hybrid ? g_phi * psi_tot
                                     : g_phi * psi_plus + psi_minus) * dV;
-            E.fracture += mp.Gc * ( phi_g * phi_g / (2.0 * mp.l0)
-                                  + 0.5 * mp.l0 * grad_phi.squaredNorm() ) * dV;
+            // AT2: Gc (phi^2/(2 l0) + l0/2 |grad phi|^2);
+            // AT1: 3Gc/8 (phi/l0 + l0 |grad phi|^2)   (see crackTerms)
+            const CrackTerms ct = crackTerms(d.crack_model, mp.Gc, mp.l0, phi_g);
+            E.fracture += ( ct.energy_local
+                          + ct.energy_grad * grad_phi.squaredNorm() ) * dV;
         }
     }
     return E;

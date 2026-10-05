@@ -122,6 +122,21 @@ energy_split = "spectral"
 # Default is false when omitted.
 hybrid = true
 
+# Crack-surface density model (the regularised crack energy; the degradation
+# g(phi) = (1-phi)^2 + k is the same for both):
+#
+#   "AT2" (default)  Gamma = Gc ( phi^2/(2 l0) + l0/2 |grad phi|^2 )
+#                    Damage starts at any load (no elastic phase); phi stays
+#                    in [0,1] on its own.
+#   "AT1"            Gamma = 3Gc/8 ( phi/l0 + l0 |grad phi|^2 )
+#                    Linear-elastic until psi+ reaches 3 Gc/(16 l0), then a
+#                    crack band of finite width. phi >= 0 is NOT automatic, so
+#                    AT1 switches solver.phi_bounds to "active_set" by itself
+#                    and needs solver.scheme = "staggered".
+#                    Note: for the same l0 the two models give different
+#                    strengths -- l0 is usually recalibrated when switching.
+crack_model = "AT2"
+
 # -----------------------------------------------------------------------------
 # Material library.
 #

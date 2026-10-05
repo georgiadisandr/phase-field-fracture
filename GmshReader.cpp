@@ -121,6 +121,7 @@ FemInput readFemInputFromGmsh(const FemSpec& spec)
     d.ndime = 2;
     d.split  = spec.split;
     d.hybrid = spec.hybrid;
+    d.crack_model = spec.crack_model;
     d.nmats = static_cast<int>(spec.materials.size());
     d.nprop = (d.nmats > 0) ? static_cast<int>(spec.materials[0].props.size()) : 0;
     d.nelem = 0;

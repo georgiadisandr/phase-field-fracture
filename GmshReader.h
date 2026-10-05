@@ -101,6 +101,10 @@ struct FemSpec {
     // still driven by psi^+ from `split`. Default false = fully anisotropic.
     bool hybrid = false;
 
+    // Crack-surface density model, TOML key fem.crack_model ("AT2" default,
+    // "AT1"). See pfm::CrackModel in ConstitutiveModel.h.
+    pfm::CrackModel crack_model = pfm::CrackModel::AT2;
+
     // Material library. props[0] is property 0 (e.g. E), props[1] (e.g. nu)...
     std::vector<Material> materials;
 

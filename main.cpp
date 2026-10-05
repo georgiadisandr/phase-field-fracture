@@ -598,6 +598,14 @@ int main(int argc, char** argv) try
     // update. The released energy from the external energy balance
     //     dD_bal = 1/2 ( P_n lambda_{n+1} - P_{n+1} lambda_n ),  P = 2 Psi_el/lambda
     // is logged alongside, as a cross-check.
+    if (d.crack_model == pfm::CrackModel::AT1)
+        std::cout << "[phi] crack model AT1 (w = phi, c_w = 8/3): linear-elastic "
+                     "until psi+ reaches 3 Gc/(16 l0); phi >= 0 enforced by the "
+                     "active set"
+                  << (cfg.phi_bounds_auto_for_at1
+                          ? " (phi_bounds switched to \"active_set\" "
+                            "automatically)" : "")
+                  << "\n";
     if (cfg.solver.phi_bounds == pfm::PhiBounds::ActiveSet)
         std::cout << "[phi] box constraint phi_n <= phi <= 1 by ACTIVE SET "
                      "(max " << cfg.solver.phi_active_set_max_iter

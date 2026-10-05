@@ -31,6 +31,9 @@ struct FemInput {
     // u) while the phase field is still driven by psi^+ from `split`.
     bool hybrid = false;
 
+    // Crack-surface density model (AT2 default, AT1). See ConstitutiveModel.h.
+    pfm::CrackModel crack_model = pfm::CrackModel::AT2;
+
     int npoin = 0; //number of total nodes
     int nelem = 0; //number of elements
 

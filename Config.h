@@ -116,6 +116,10 @@ struct StepControl {
 };
 
 struct AppConfig {
+    // Set by the loader when fem.crack_model = "AT1" forced
+    // solver.phi_bounds = "active_set" (AT1 needs phi >= 0). Reported by main.
+    bool phi_bounds_auto_for_at1 = false;
+
     // Mesh + geometry knobs (W, H, a, y_crack, h_fine, h_far, r_fine, r_far,
     // base_name). Defaults come from mesh::Config.
     mesh::Config mesh;

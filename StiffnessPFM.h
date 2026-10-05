@@ -203,7 +203,8 @@ computeElementStresses(const FemInput&        d,
 // Miehe/AT2 normalization, matching the assembled residual in this file):
 //
 //   E_elastic  = INT_V [ g(phi) psi^+ + psi^- ] dV
-//   E_fracture = INT_V  Gc ( phi^2/(2 l0) + (l0/2)|grad phi|^2 ) dV
+//   E_fracture = INT_V  Gc ( phi^2/(2 l0) + (l0/2)|grad phi|^2 ) dV   (AT2)
+//              = INT_V  3Gc/8 ( phi/l0 + l0 |grad phi|^2 ) dV             (AT1)
 //   E_total    = E_elastic + E_fracture
 //
 // This is the scalar whose stationarity gives R^u / R^phi, and the natural
@@ -216,7 +217,7 @@ computeElementStresses(const FemInput&        d,
 // ===========================================================================
 struct EnergyParts {
     double elastic  = 0.0;   // INT g(phi) psi^+ + psi^- dV
-    double fracture = 0.0;   // INT Gc ( phi^2/(2 l0) + (l0/2)|grad phi|^2 ) dV
+    double fracture = 0.0;   // crack energy (AT2 or AT1 form, see above)
     double total() const { return elastic + fracture; }
 };
 

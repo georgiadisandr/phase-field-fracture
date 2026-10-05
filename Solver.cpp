@@ -328,7 +328,8 @@ SolverResult subsolvePhiActiveSet(const FemInput&        d,
     static SpLDLT ldltA;
     static bool   ldltA_analyzed = false;
     std::vector<signed char>& state = g_phi_active;
-    if (static_cast<int>(state.size()) != n) state.assign(n, 0);
+    const bool fresh_state = (static_cast<int>(state.size()) != n);
+    if (fresh_state) state.assign(n, 0);
 
     PhiSystem sys = assemblePhi_System(d, u, phi, history);
     const Eigen::SparseMatrix<double> K0   = sys.K;   // assembler-owned: copy
@@ -353,6 +354,16 @@ SolverResult subsolvePhiActiveSet(const FemInput&        d,
             if (it.row() == it.col()) kmax = std::max(kmax, std::abs(it.value()));
     const double tol_x = 1e-12;
     const double tol_R = 1e-12 * std::max(kmax, 1e-300);
+
+    // First call of the run: start with every node that sits ON its lower
+    // bound held there (at t = 0 that is all of them). The update rule
+    // releases the ones that want to grow. This matters for AT1: with no
+    // damage yet (H = 0) its phi matrix is only the Laplacian term, which is
+    // singular without any fixed node -- an all-free first pass would fail
+    // to factorise.
+    if (fresh_state)
+        for (int i = 0; i < n; ++i)
+            if (phi0(i) <= lo(i) + tol_x) state[i] = -1;
 
     Eigen::SparseMatrix<double> K;
     Eigen::VectorXd x = phi0, Rx = R0, rhs, dfix(n);
