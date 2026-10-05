@@ -791,8 +791,12 @@ int main(int argc, char** argv) try
                 diss_success = 0;
                 ++subdiv_streak;
                 dtau_cur *= 0.5;
-                std::cerr << "  [adaptive] non-converged dissipation step rolled "
-                          << "back; dtau halved to " << dtau_cur
+                std::cerr << "  [adaptive] "
+                          << (dc.unload_capped
+                                  ? "dissipation step too large for the snap-back "
+                                    "(unload cap)"
+                                  : "non-converged dissipation step")
+                          << " rolled back; dtau halved to " << dtau_cur
                           << " and retrying.\n";
                 continue;
             }
@@ -872,6 +876,13 @@ int main(int argc, char** argv) try
                 if (was_diss) {
                     ++diss_steps;
                     D_target    += dtau_cur;
+                    // A step accepted on the reload cap dissipated LESS than
+                    // its target on purpose (dtau not reachable within
+                    // dissipation_max_du). Do not carry that shortfall into
+                    // the next step -- it would ask for up to 2*dtau right
+                    // when the crack starts to run. Restart the cumulative
+                    // target from what was actually dissipated.
+                    if (dc.capped) D_target = D_cum;
                     diss_success = forced_accept ? 0 : diss_success + 1;
                     const auto prec = std::cout.precision();
                     std::cout << std::setprecision(8)
