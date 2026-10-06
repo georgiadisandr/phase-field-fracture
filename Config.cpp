@@ -640,14 +640,19 @@ void validate(const AppConfig& cfg)
             throw std::invalid_argument(
                 "run.dissipation_step (dtau) must be > 0 when "
                 "run.load_control = \"dissipation\"");
-        if (cfg.solver.scheme != pfm::SolverScheme::Staggered)
+        // Staggered: crack-energy constraint, u = lambda*u_hat -> hybrid.
+        // Monolithic: energy-balance constraint on the bordered Newton
+        // system -> any formulation, but no phi bounds (hence no AT1).
+        if (cfg.solver.scheme == pfm::SolverScheme::Staggered && !cfg.fem.hybrid)
             throw std::invalid_argument(
-                "run.load_control = \"dissipation\" is implemented for "
-                "solver.scheme = \"staggered\" only");
-        if (!cfg.fem.hybrid)
+                "run.load_control = \"dissipation\" with the staggered scheme "
+                "needs fem.hybrid = true (the u-sub-problem must be linear in "
+                "the load factor)");
+        if (cfg.solver.scheme == pfm::SolverScheme::Monolithic &&
+            cfg.solver.phi_bounds != pfm::PhiBounds::None)
             throw std::invalid_argument(
-                "run.load_control = \"dissipation\" needs fem.hybrid = true "
-                "(the u-sub-problem must be linear in the load factor)");
+                "run.load_control = \"dissipation\" with the monolithic scheme "
+                "does not support solver.phi_bounds (use the staggered scheme)");
         if (cfg.step.dissipation_max_steps <= 0)
             throw std::invalid_argument("run.dissipation_max_steps must be > 0");
         if (cfg.step.dissipation_tol <= 0.0)

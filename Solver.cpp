@@ -913,6 +913,203 @@ SolverResult solveStepStaggered(const FemInput&        d,
     return res;
 }
 
+// ===========================================================================
+// Monolithic dissipation control (energy-balance constraint)
+//
+// Unknowns: x = [u_free | phi] and the load factor lambda; the prescribed
+// displacements follow the load, u_p = lambda * u_hat_p (u_hat_p = the
+// Dirichlet values of the TOML at full load). One extra equation fixes the
+// energy released in the step (Gutierrez 2004; Verhoosel et al. 2009):
+//
+//     g(x, lambda) = 1/2 ( P_n lambda - P(x, lambda) lambda_n ) - dD = 0
+//
+// with P = u_hat_p . f_int,p the generalised force conjugate to lambda (the
+// reaction at the loaded DOFs projected on the load pattern). At equilibrium
+// P lambda = 2 Psi_el, so this is external work minus stored energy.
+//
+// Newton on the bordered system, solved with ONE factorisation and two
+// back-substitutions (Batoz & Dhatt):
+//
+//     [ K    r_lam ] [dx  ]     [R]        r_lam = dR/dlambda = K_{:,p} u_hat_p
+//     [ c^T  c_lam ] [dlam] = - [g]        c     = dg/dx      = -lambda_n/2 K_{p,:}^T u_hat_p
+//                                          c_lam = dg/dlambda = P_n/2 - lambda_n/2 u_hat_p^T K_pp u_hat_p
+//
+//     K dx_R = -R,  K dx_l = -r_lam,  dlam = -(g + c.dx_R)/(c.dx_l + c_lam),
+//     dx = dx_R + dlam dx_l,  du_p = dlam u_hat_p
+//
+// (K is the full coupled tangent with the Dirichlet rows/columns replaced by
+// identity; r_lam, c and c_lam come from the UNMODIFIED K.)
+//
+// The update is damped by a backtracking line search on the merit
+//     m = sqrt( (|R_free|/R_ref)^2 + (g/dD)^2 ).
+// lambda is kept within lambda_n +- dlambda_max; the cap rules match the
+// staggered version (reload cap accepted, unload cap rejected).
+// Does not need the hybrid formulation. AT2 without phi bounds only.
+// ===========================================================================
+SolverResult solveStepMonolithicDissipation(const FemInput&        d,
+                                            Eigen::VectorXd&       u,
+                                            Eigen::VectorXd&       phi,
+                                            const HistoryField&    history,
+                                            DissipationControl&    dc,
+                                            const SolverSettings&  settings)
+{
+    const int npoin = d.npoin;
+    const int n_u   = 2 * npoin;
+    const int ntot  = 3 * npoin;
+    SolverResult res;
+
+    static SpLU lu;
+    static bool lu_analyzed = false;
+
+    // Load pattern w (full length; nonzero only on loaded Dirichlet DOFs) and
+    // the constrained-DOF mask.
+    Eigen::VectorXd   w = Eigen::VectorXd::Zero(ntot);
+    std::vector<char> cmask(ntot, 0);
+    for (int i = 0; i < d.nvfix; ++i)
+        for (int k = 0; k < d.ndofn; ++k)
+            if (d.iffix[i][k] != 0) {
+                const int gdof = 2 * d.nofix[i] + k;
+                cmask[gdof] = 1;
+                w(gdof)     = d.fixed[i][k];
+            }
+    const auto setPrescribed = [&](Eigen::VectorXd& uu, double L) {
+        for (int i = 0; i < d.nvfix; ++i)
+            for (int k = 0; k < d.ndofn; ++k)
+                if (d.iffix[i][k] != 0)
+                    uu(2 * d.nofix[i] + k) = L * d.fixed[i][k];
+    };
+    const auto freeNorm = [&](const Eigen::VectorXd& R) {
+        double s2 = 0.0;
+        for (int i = 0; i < ntot; ++i) if (!cmask[i]) s2 += R(i) * R(i);
+        return std::sqrt(s2);
+    };
+    const auto gOf = [&](double L, double P) {
+        return 0.5 * (dc.P_n * L - P * dc.lambda_n) - dc.dD;
+    };
+
+    const double lmax = dc.lambda_n + dc.dlambda_max;
+    const double lmin = std::max(dc.lambda_n - dc.dlambda_max, 0.05 * dc.lambda_n);
+
+    double lam = std::min(std::max(dc.lambda_pred, lmin), lmax);
+    setPrescribed(u, lam);
+    dc.capped = false;  dc.unload_capped = false;  dc.lambda = lam;
+
+    if (settings.verbose)
+        std::cout << "[solver] MONOLITHIC, DISSIPATION CONTROL (energy balance)  dD = "
+                  << dc.dD << ",  lambda_n = " << dc.lambda_n
+                  << ",  predictor = " << lam
+                  << "  (max " << settings.max_iter << " Newton its)\n";
+
+    double R_ref = -1.0;
+    int    cap_side = 0;          // +1 lambda on lmax, -1 on lmin
+    const double eps_cap = 1e-12 * std::max(1.0, std::abs(lmax));
+
+    for (int iter = 0; iter < settings.max_iter; ++iter) {
+        GlobalSystem sys = assembleGlobalSystem(d, u, phi, history);
+        const double P  = w.dot(sys.R);
+        const double g  = gOf(lam, P);
+        const double Rn = freeNorm(sys.R);
+        if (iter == 0) {
+            double rr = 0.0;
+            for (int i = 0; i < ntot; ++i) if (cmask[i]) rr += sys.R(i) * sys.R(i);
+            R_ref = std::max({Rn, 1e-3 * std::sqrt(rr), settings.tol_abs});
+            res.initial_residual = Rn;
+        }
+        const double tolR = std::max(settings.tol_abs, settings.tol_rel * R_ref);
+        const bool   R_ok = (Rn < tolR);
+        const bool   g_ok = std::abs(g) <= dc.tol * dc.dD;
+        cap_side = (std::abs(lam - lmax) <= eps_cap) ? +1
+                 : (std::abs(lam - lmin) <= eps_cap) ? -1 : 0;
+
+        res.iters_used     = iter;
+        res.final_residual = Rn;
+        dc.lambda          = lam;
+        dc.dGamma          = g + dc.dD;     // released energy so far
+
+        if (settings.verbose) {
+            const auto prec = std::cout.precision();
+            std::cout << "  iter " << iter << "  |R| = " << Rn
+                      << "   |R|/|Rref| = " << Rn / R_ref
+                      << std::setprecision(10) << "   lambda = " << lam
+                      << std::setprecision(4) << "   dD_bal/dD = " << (g + dc.dD) / dc.dD
+                      << std::setprecision(prec)
+                      << (cap_side > 0 ? " [reload cap]" : cap_side < 0 ? " [unload cap]" : "")
+                      << "\n";
+        }
+
+        if (R_ok && g_ok) { res.converged = true; break; }
+        if (R_ok && cap_side > 0 && g < 0.0) {           // reload cap: accept
+            dc.capped = true;  res.converged = true;  break;
+        }
+        if (R_ok && cap_side < 0 && g > 0.0) {           // unload cap: reject
+            dc.unload_capped = true;
+            if (settings.verbose)
+                std::cout << "  [solver] dissipation step rejected: even the "
+                             "largest allowed unloading (dissipation_max_du) "
+                             "releases more than dD -- step too large here\n";
+            res.converged = false;
+            return res;
+        }
+
+        // Border terms from the UNMODIFIED tangent.
+        const Eigen::VectorXd Kw  = sys.K * w;
+        const Eigen::VectorXd KTw = sys.K.transpose() * w;
+        const double c_lam = 0.5 * dc.P_n - 0.5 * dc.lambda_n * w.dot(Kw);
+        Eigen::VectorXd r_lam = Kw, c = -0.5 * dc.lambda_n * KTw;
+        for (int i = 0; i < ntot; ++i) if (cmask[i]) { r_lam(i) = 0.0; c(i) = 0.0; }
+
+        // u_p already equals lam*u_hat_p, so the prescribed increment is 0:
+        // applyDirichlet only replaces the constrained rows/columns.
+        applyDirichlet(sys.K, sys.R, d, u, lam);
+        const Eigen::VectorXd dxR =
+            factorizeAndSolve(lu, lu_analyzed, sys.K, -sys.R, "monolithic dissipation");
+        Eigen::VectorXd dxL;
+        {
+            prof::Scope _t(prof::Solve);
+            dxL = lu.solve(-r_lam);
+        }
+        if (lu.info() != Eigen::Success || !dxL.allFinite())
+            throw std::runtime_error("monolithic dissipation: second solve failed");
+
+        const double den = c.dot(dxL) + c_lam;
+        double dlam = (std::abs(den) > 1e-300) ? -(g + c.dot(dxR)) / den : 0.0;
+        if (!std::isfinite(dlam)) dlam = 0.0;
+        if (lam + dlam > lmax) dlam = lmax - lam;      // keep lambda within the cap
+        if (lam + dlam < lmin) dlam = lmin - lam;
+        const Eigen::VectorXd dx = dxR + dlam * dxL;
+
+        // Backtracking line search on the merit function.
+        const double m0 = std::hypot(Rn / R_ref, g / dc.dD);
+        double alpha = 1.0;
+        Eigen::VectorXd u_t, phi_t;
+        double lam_t = lam;
+        for (int ls = 0; ls < 6; ++ls) {
+            u_t   = u   + alpha * dx.head(n_u);
+            phi_t = phi + alpha * dx.tail(npoin);
+            lam_t = lam + alpha * dlam;
+            setPrescribed(u_t, lam_t);
+            const Eigen::VectorXd Rt = assembleGlobalResidual(d, u_t, phi_t, history);
+            const double mt = std::hypot(freeNorm(Rt) / R_ref,
+                                         gOf(lam_t, w.dot(Rt)) / dc.dD);
+            if (mt <= (1.0 - 1e-4 * alpha) * m0) break;
+            if (ls < 5) alpha *= 0.5;                  // last try is accepted as is
+        }
+        if (settings.verbose && alpha < 1.0)
+            std::cout << "    line search: alpha = " << alpha << "\n";
+        u = u_t;  phi = phi_t;  lam = lam_t;
+        res.iters_used = iter + 1;
+    }
+
+    dc.lambda = lam;
+    if (!res.converged && settings.verbose)
+        std::cout << "[solver] monolithic dissipation step did NOT converge in "
+                  << settings.max_iter << " iterations\n";
+    else if (settings.verbose)
+        std::cout << "[solver] converged in " << res.iters_used << " iterations"
+                  << (dc.capped ? " (on the reload cap)" : "") << "\n";
+    return res;
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -955,16 +1152,23 @@ SolverResult solveStepDissipation(const FemInput&        d,
         throw std::runtime_error("solveStepDissipation: u size != 2*npoin");
     if (phi.size() != npoin)
         throw std::runtime_error("solveStepDissipation: phi size != npoin");
-    if (settings.scheme != SolverScheme::Staggered)
-        throw std::runtime_error(
-            "solveStepDissipation: dissipation control needs the staggered scheme");
-    if (!d.hybrid)
-        throw std::runtime_error(
-            "solveStepDissipation: dissipation control needs fem.hybrid = true");
     if (dc.lambda_n <= 0.0 || dc.dD <= 0.0 || dc.dlambda_max <= 0.0)
         throw std::runtime_error(
             "solveStepDissipation: needs lambda_n > 0, dD > 0 and "
             "dlambda_max > 0");
+    if (settings.scheme == SolverScheme::Monolithic) {
+        if (settings.phi_bounds != PhiBounds::None)
+            throw std::runtime_error(
+                "solveStepDissipation: monolithic dissipation control does not "
+                "support phi bounds");
+        if (dc.P_n <= 0.0)
+            throw std::runtime_error(
+                "solveStepDissipation: monolithic version needs P_n > 0");
+        return solveStepMonolithicDissipation(d, u, phi, history, dc, settings);
+    }
+    if (!d.hybrid)
+        throw std::runtime_error(
+            "solveStepDissipation: the staggered version needs fem.hybrid = true");
     return solveStepStaggered(d, u, phi, history, dc.lambda_pred, settings, &dc,
                               phi_lower);
 }

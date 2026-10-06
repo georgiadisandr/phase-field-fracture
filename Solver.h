@@ -198,6 +198,9 @@ struct DissipationControl {
     double slope       = 0.0;    // rough dGamma/dlambda (> 0), 0 = unknown
     double dlambda_max = 0.0;    // cap on |lambda - lambda_n| (> 0)
     double tol         = 1.0e-2; // |g| <= tol * dD
+    // Monolithic version only (energy-balance constraint): generalised force
+    // conjugate to lambda at the last accepted state, P_n = 2 Psi_el/lambda_n.
+    double P_n         = 0.0;
     // ---- outputs ----
     double lambda    = 0.0;      // load factor of the returned state
     double dGamma    = 0.0;      // achieved crack-energy increase
@@ -209,7 +212,12 @@ struct DissipationControl {
     int    n_phi_solves = 0;     // phi-solves used (root-finder evaluations)
 };
 
-// Staggered scheme only (the caller must have checked settings.scheme).
+// Dispatches on settings.scheme:
+//   Staggered  -- crack-energy constraint (above); needs fem.hybrid = true.
+//   Monolithic -- energy-balance constraint on the bordered Newton system
+//                 (see solveStepMonolithicDissipation in Solver.cpp); needs
+//                 dc.P_n, no phi bounds, works with or without hybrid.
+//                 dc.dGamma then reports the energy-balance dissipation.
 // u and phi are updated in place; on return u corresponds to dc.lambda.
 SolverResult solveStepDissipation(const FemInput&        d,
                                   Eigen::VectorXd&       u,

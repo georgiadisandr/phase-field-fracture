@@ -617,6 +617,13 @@ int main(int argc, char** argv) try
 
     const bool diss_mode =
         (cfg.step.load_control == appcfg::LoadControl::Dissipation);
+    // Which dissipation measure drives the switch, the per-step target and
+    // the predictor: the crack energy Gamma (staggered) or the energy balance
+    // 1/2(P_n lambda - P lambda_n) (monolithic, matches its constraint).
+    const bool diss_balance =
+        diss_mode && cfg.solver.scheme == pfm::SolverScheme::Monolithic;
+    const char* diss_name = diss_balance ? "energy-balance dissipation"
+                                         : "E_fracture";
     bool   diss_on      = false;  // currently under dissipation control
     bool   diss_done    = false;  // switched back for good (specimen unloaded)
     double psi_n        = 0.0;    // elastic energy of the last accepted state
@@ -650,7 +657,7 @@ int main(int argc, char** argv) try
                     "phi_solves,bisections,capped,converged\n";
         std::cout << "[step] DISSIPATION CONTROL enabled: dtau = "
                   << cfg.step.dissipation_step << ", switch when a step "
-                  << "raises E_fracture by >= " << diss_switch
+                  << "raises the " << diss_name << " by >= " << diss_switch
                   << ", max |du| per step = "
                   << (cfg.step.dissipation_max_du > 0.0
                           ? std::to_string(cfg.step.dissipation_max_du)
@@ -735,6 +742,7 @@ int main(int argc, char** argv) try
                                       : 10.0 * nominal * u_ref;
             dc.lambda_n    = lf_done;
             dc.Gamma_n     = gamma_n;
+            dc.P_n         = 2.0 * psi_n / lf_done;   // monolithic constraint
             dc.dD          = dD_eff;
             dc.dlambda_max = du_cap / u_ref;
             dc.tol         = cfg.step.dissipation_tol;
@@ -864,10 +872,10 @@ int main(int argc, char** argv) try
                 psi_new  = Ea.elastic;
                 frac_new = Ea.fracture;
                 dG_step  = frac_new - gamma_n;
-                D_cum   += dG_step;
                 const double P_old = (lf_prev > 0.0) ? 2.0 * psi_n   / lf_prev : 0.0;
                 const double P_new = (lf_try  > 0.0) ? 2.0 * psi_new / lf_try  : 0.0;
                 dB_step    = 0.5 * (P_old * lf_try - P_new * lf_prev);
+                D_cum     += diss_balance ? dB_step : dG_step;
                 D_bal_cum += dB_step;
             }
             u_saved   = u;
@@ -911,7 +919,8 @@ int main(int argc, char** argv) try
                     std::cout << std::setprecision(8)
                               << "  [dissipation] lambda = " << lf_done
                               << "  (dlambda = " << (lf_done - lf_prev)
-                              << "),  dGamma = " << dG_step
+                              << "),  " << (diss_balance ? "dD_bal" : "dGamma")
+                              << " = " << (diss_balance ? dB_step : dG_step)
                               << " (target " << dD_eff << ")"
                               << ",  D_cum = " << D_cum
                               << (dc.capped ? "  [CAPPED: target not reachable "
@@ -927,12 +936,13 @@ int main(int argc, char** argv) try
                     }
                 } else if (!diss_done && !forced_accept &&
                            lf_prev > 0.0 && psi_new > 0.0 &&
-                           dG_step >= diss_switch) {
+                           (diss_balance ? dB_step : dG_step) >= diss_switch) {
                     diss_on      = true;
                     D_target     = D_cum;
                     dtau_cur     = cfg.step.dissipation_step;
                     diss_success = 0;
-                    std::cout << "  [dissipation] step raised E_fracture by " << dG_step
+                    std::cout << "  [dissipation] step raised the " << diss_name
+                              << " by " << (diss_balance ? dB_step : dG_step)
                               << " >= switch " << diss_switch
                               << " -- SWITCHING TO DISSIPATION CONTROL at "
                                  "load_factor = " << lf_done << "\n";
@@ -941,7 +951,7 @@ int main(int argc, char** argv) try
                 psi_max   = std::max(psi_max, psi_new);
                 gamma_n   = frac_new;
                 dlam_last = lf_done - lf_prev;
-                dgam_last = dG_step;
+                dgam_last = diss_balance ? dB_step : dG_step;
             }
 
             // VTK snapshot only on the stride (step 0 already written before

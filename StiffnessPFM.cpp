@@ -168,7 +168,13 @@ void elementSystem(const std::vector<int>&    nodes,
             const fem::UDofVec BtSp  = Bu.transpose() * sp.sigma_plus;
             const fem::UDofVec BtSps = Bu.transpose() * sp.sigma_plus_split;
             K_uphi += (-2.0 * (1.0 - phi_g)) * (BtSp  * N.transpose()) * dV;
-            K_phiu += (-2.0 * (1.0 - phi_g)) * (N * BtSps.transpose()) * dV;
+            // H_eff = max(H_stored, psi+): it depends on u only where the
+            // current psi+ is the larger one. Where the stored history wins,
+            // dH/du = 0 and so is this block -- including it there made the
+            // monolithic tangent inconsistent (linear instead of quadratic
+            // Newton convergence once a history field exists).
+            if (sp.psi_plus > H_elem[g])
+                K_phiu += (-2.0 * (1.0 - phi_g)) * (N * BtSps.transpose()) * dV;
 
             // K_phiphi : grad Bphi^T Bphi + (local_K + 2 H) N N^T.
             K_phiphi += ct.grad * (Bphi.transpose() * Bphi) * dV;

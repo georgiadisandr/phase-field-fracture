@@ -368,8 +368,21 @@ max_subdivs = 0
 #                                u = lambda*u_hat gives E_fracture = E_n + dtau
 #                                (a few cheap phi-solves, no extra u-solves)
 #                       u      = lambda * u_hat
-#                     Requires: solver.scheme = "staggered", fem.hybrid = true,
-#                     pure Dirichlet loading (no [[neumann]] / [[point_load]]).
+#                     Staggered: needs fem.hybrid = true.
+#
+#                     With solver.scheme = "monolithic" the constraint is the
+#                     ENERGY-BALANCE dissipation instead (Gutierrez 2004):
+#                       1/2 (P_n lambda - P lambda_n) = dtau,
+#                       P = reaction . load pattern  (P lambda = 2 Psi_el),
+#                     added as one extra row/column to the Newton system and
+#                     solved with two back-substitutions of the same LU
+#                     factorisation, with a backtracking line search. The
+#                     switch threshold, dtau and the CSV target then refer to
+#                     this energy-balance measure. Works with or without
+#                     hybrid; no phi_bounds (so AT2 only).
+#
+#                     Both: pure Dirichlet loading (no [[neumann]] /
+#                     [[point_load]]).
 #                     Writes <base_name>_dissipation.csv (lambda, Psi_el,
 #                     E_fracture, dGamma per step, energy-balance cross-check,
 #                     phi-solves, mode, ...).
