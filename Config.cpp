@@ -307,6 +307,57 @@ void loadFemSection(const toml::table& root, fem::FemSpec& spec)
             spec.initial_phi.push_back(std::move(ip));
         }
     }
+
+    // Initial cracks through the history field: optional [[initial_history]]
+    // entries (see fem::InitialHistorySpec). Each needs a 1D physical group
+    // and/or an explicit polyline `points = [[x0, y0], [x1, y1], ...]`.
+    if (const auto* arr = root["initial_history"].as_array()) {
+        for (std::size_t i = 0; i < arr->size(); ++i) {
+            const std::string where =
+                "initial_history[" + std::to_string(i) + "]";
+            const auto* mt = arr->get(i)->as_table();
+            if (!mt)
+                throw std::runtime_error(where + " is not a table");
+
+            fem::InitialHistorySpec ih;
+            readString(*mt, "physical_name", ih.physical_name);
+
+            if (const auto* pts = (*mt)["points"].as_array()) {
+                for (std::size_t k = 0; k < pts->size(); ++k) {
+                    const std::vector<double> xy = readDoubleArray(
+                        (*mt)["points"][k],
+                        where + ".points[" + std::to_string(k) + "]");
+                    if (xy.size() != 2)
+                        throw std::runtime_error(
+                            where + ".points[" + std::to_string(k)
+                            + "] must be [x, y]");
+                    ih.points.push_back({xy[0], xy[1]});
+                }
+                if (ih.points.size() < 2)
+                    throw std::runtime_error(
+                        where + ".points needs at least two points "
+                                "(one segment)");
+            } else if ((*mt)["points"]) {
+                throw std::runtime_error(
+                    where + ".points must be an array of [x, y] pairs");
+            }
+
+            if (ih.physical_name.empty() && ih.points.empty())
+                throw std::runtime_error(
+                    where + " needs physical_name (a 1D gmsh group) and/or "
+                            "points (a polyline [[x0, y0], [x1, y1], ...])");
+
+            readDouble(*mt, "B", ih.B);
+            if (!(ih.B > 0.0))
+                throw std::runtime_error(where + ".B must be > 0");
+            readDouble(*mt, "half_width", ih.half_width);
+            if (ih.half_width < 0.0)
+                throw std::runtime_error(
+                    where + ".half_width must be >= 0 (0 = l0/4)");
+
+            spec.initial_history.push_back(std::move(ih));
+        }
+    }
 }
 
 void loadSolverSection(const toml::table& root, pfm::SolverSettings& s)

@@ -374,6 +374,42 @@ int main(int argc, char** argv) try
     // and is raised after every converged step (see updateHistory).
     pfm::HistoryField history = pfm::makeHistoryField(d);
 
+    // ---- Initial cracks through the history field ([[initial_history]]) ----
+    // H is raised near each crack line (Borden et al. 2012) and the phase
+    // field is solved ONCE at zero load, so the crack exists with its smooth
+    // profile before the first load step. Its crack energy is the baseline
+    // of the dissipation bookkeeping (gamma_n below) -- otherwise the energy
+    // of creating the pre-crack would be booked in step 1.
+    double initial_crack_energy = 0.0;
+    if (!d.initial_cracks.empty()) {
+        const auto reports = pfm::seedInitialCrackHistory(d, history);
+        for (const auto& r : reports) {
+            std::cout << "[init] initial_history '" << r.label << "': "
+                      << r.n_segments << " segment(s), H0 seeded at "
+                      << r.n_gauss << " Gauss point(s), max H0 = " << r.H_max
+                      << ", half-width w = " << r.w_min;
+            if (r.w_max > r.w_min) std::cout << ".." << r.w_max;
+            std::cout << "\n";
+            if (r.n_gauss == 0)
+                throw std::runtime_error(
+                    "initial_history '" + r.label + "': no Gauss point lies "
+                    "within the half-width of the crack line -- check the "
+                    "coordinates, or refine the mesh / raise half_width");
+        }
+
+        const Eigen::VectorXd phi_lower0 = phi;   // 0, or [[initial_phi]]
+        const pfm::SolverResult r0 = pfm::solveStep(d, u, phi, history, 0.0,
+                                                    cfg.solver, &phi_lower0);
+        initial_crack_energy = pfm::computeEnergy(d, u, phi).fracture;
+        std::cout << "[init] initial crack solve at zero load: "
+                  << (r0.converged ? "converged" : "NOT CONVERGED")
+                  << ", max phi = " << phi.maxCoeff()
+                  << ", crack energy = " << initial_crack_energy << "\n";
+        if (!r0.converged)
+            std::cerr << "[init] WARNING: the zero-load phase-field solve for "
+                         "the initial crack did not converge\n";
+    }
+
     // Per-step snapshots live in the nested vtk/ folder created at startup, so
     // the CSVs and the log stay visible at the top of the run directory rather
     // than buried among a couple of thousand .vtk files.
@@ -628,7 +664,8 @@ int main(int argc, char** argv) try
     bool   diss_done    = false;  // switched back for good (specimen unloaded)
     double psi_n        = 0.0;    // elastic energy of the last accepted state
     double psi_max      = 0.0;    // largest accepted elastic energy so far
-    double gamma_n      = 0.0;    // crack energy E_fracture of that state
+    double gamma_n      = initial_crack_energy;  // E_fracture of that state
+                                  // (starts at the pre-crack's energy)
     double dlam_last    = 0.0;    // last accepted load-factor increment
     double dgam_last    = 0.0;    // last accepted crack-energy increment
     double D_cum        = 0.0;    // cumulative crack-energy increase

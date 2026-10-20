@@ -9,6 +9,7 @@
 // struct used by the rest of the FEM code.
 
 #include "FEMINPUT.h"
+#include <array>
 #include <string>
 #include <utility>
 #include <vector>
@@ -84,6 +85,34 @@ struct InitialPhiSpec {
     double      value = 0.0;
 };
 
+// One initial crack seeded through the HISTORY field (Borden et al. 2012),
+// TOML [[initial_history]]. At every Gauss point within distance w of the
+// crack line the stored history is raised to
+//
+//     H0(d) = B * H_c * (1 - d / w),        d <= w   (0 beyond)
+//
+//     H_c = Gc / (2 l0)       (AT2)   -> homogeneous phi = B / (1 + B)
+//     H_c = 3 Gc / (16 l0)    (AT1)   -> homogeneous phi = 1 - 1 / B
+//
+// so the phase field forms a fully developed crack (with its optimal smooth
+// profile) on the first phi-solve and can never heal: H0 enters the crack
+// driving force H_eff = max(H, psi+) in BOTH irreversibility modes.
+//
+// The crack line is given EITHER (or both) as
+//   physical_name : a 1D gmsh physical group (its line elements are the
+//                   segments; the line must be part of the mesh), and/or
+//   points        : an explicit polyline [[x0,y0],[x1,y1],...] in model
+//                   coordinates -- no mesh change needed.
+//   B             : amplification factor (default 1e3, Borden's value).
+//   half_width    : w in mm; <= 0 (default) means l0/4 of the element's
+//                   material (= Borden's l0/2 in his half-length convention).
+struct InitialHistorySpec {
+    std::string                        physical_name;
+    std::vector<std::array<double, 2>> points;
+    double                             B          = 1.0e3;
+    double                             half_width = 0.0;
+};
+
 // Everything the FEM solver needs that gmsh does NOT know about.
 struct FemSpec {
     int ntype = 1;     // 1 plane-stress, 2 plane-strain
@@ -130,6 +159,10 @@ struct FemSpec {
     // Initial phi overrides applied at step 0, per physical group (any dim).
     // Optional; an empty vector means phi starts at zero everywhere.
     std::vector<InitialPhiSpec> initial_phi;
+
+    // Initial cracks seeded through the history field (see
+    // InitialHistorySpec). Optional; empty = H starts at zero everywhere.
+    std::vector<InitialHistorySpec> initial_history;
 };
 
 // Build the FemInput from the live gmsh model + the user-supplied spec.

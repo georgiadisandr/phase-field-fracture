@@ -25,6 +25,7 @@
 
 #include <Eigen/Dense>
 
+#include <string>
 #include <vector>
 
 namespace pfm {
@@ -36,6 +37,26 @@ using HistoryField = std::vector<std::vector<double>>;
 // Zero-initialised history sized to the mesh (one slot per Gauss point of
 // every element). Call once, before the load-stepping loop.
 [[nodiscard]] HistoryField makeHistoryField(const FemInput& d);
+
+// Seed the initial cracks of d.initial_cracks ([[initial_history]]) into a
+// freshly made history field (Borden et al. 2012). At every Gauss point at
+// distance d <= w from a crack segment
+//
+//     history[e][g] = max(history[e][g], B * H_c * (1 - d / w))
+//
+// with H_c = Gc/(2 l0) (AT2) or 3 Gc/(16 l0) (AT1) and w = half_width, or
+// l0/4 when half_width <= 0; Gc, l0 are those of the element's material.
+// Call once, right after makeHistoryField(), before any solve.
+struct SeedReport {
+    std::string label;        // crack label (group name or initial_history[i])
+    int         n_segments = 0;
+    int         n_gauss    = 0;   // Gauss points that received H0 > 0
+    double      H_max      = 0.0; // largest H0 written
+    double      w_min      = 0.0; // half-widths actually used (per material)
+    double      w_max      = 0.0;
+};
+[[nodiscard]] std::vector<SeedReport>
+seedInitialCrackHistory(const FemInput& d, HistoryField& history);
 
 // After a CONVERGED load step, raise the stored history to include the
 // current state:  history[e][g] = max(history[e][g], psi^+(u) at that point).

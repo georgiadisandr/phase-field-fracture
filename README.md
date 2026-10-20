@@ -127,6 +127,7 @@ The supplied TOML files contain detailed inline explanations. Key sections are:
 | `[[neumann]]` | Boundary tractions |
 | `[[point_load]]` | Concentrated loads |
 | `[[initial_phi]]` | Initial phase-field values on physical groups |
+| `[[initial_history]]` | Initial cracks seeded through the history field (Borden et al. 2012) |
 | `[solver]` | Newton tolerances, coupling scheme, staggered stopping settings |
 | `[run]` | Load schedule, subdivision, output cadence, previews, profiling |
 
@@ -149,6 +150,33 @@ For `step_mode = "uniform"`, `N_steps` controls the increments. For `"two_stage"
 Set `source = "file"` and `path` under `[mesh]`, or pass `--mesh-file`. Physical-group names must match the material and boundary-condition entries exactly. Use planar 2D meshes with supported element types and appropriate physical groups for surfaces, edges, and points. Represent an explicitly open crack with separate, unmerged nodes on its opposing faces.
 
 The supplied bending configuration references `Domain`, `SupportLeft`, `SupportRight`, and `LoadPad`. Its active energy split is `"none"`, despite nearby comments referring to a spectral split; check active values when interpreting an experiment.
+
+### Initial cracks through the history field
+
+`[[initial_history]]` places a pre-crack without changing the mesh. Near the crack line the stored history field is raised (Borden et al. 2012):
+
+```
+H0(d) = B * H_c * (1 - d / w)    for d <= w,   0 beyond
+H_c   = Gc / (2 l0)      (AT2: phi = B/(1+B) on the line)
+H_c   = 3 Gc / (16 l0)   (AT1: phi = 1 - 1/B on the line)
+```
+
+where `d` is the distance from a Gauss point to the crack line. Before the first load step the phase field is solved once at zero load, so the crack exists with its smooth profile from step 0. Its crack energy is printed and used as the starting value of the dissipation bookkeeping. Because `H0` enters the driving force `max(H, psi+)` on every solve, the crack cannot heal, in both `irreversibility` modes. (By contrast, `[[initial_phi]]` only holds with `irreversibility = "bounds"`.)
+
+```toml
+[[initial_history]]
+points     = [[44.0, 8.0], [44.0, 10.0]]  # polyline in model coordinates, and/or
+# physical_name = "InitialCrack"           # a meshed 1D physical group
+B          = 1.0e3                         # optional, default 1e3
+half_width = 0.0                           # optional w in mm; 0 = l0/4
+```
+
+Several entries may be given. Notes:
+
+- The mesh must resolve the crack band (`h <= l0/3` around the line). The run stops with an error if no Gauss point lies within `w` of the line.
+- With the default `B = 1e3` and `w = l0/4`, AT2 overshoots slightly on the line in `history` mode (phi about 1.04 on the line, up to about 1.1 at its ends). With `phi_bounds = "active_set"` phi is capped at 1, but the band next to the line becomes slightly wider. `B = 1e2` avoids both effects and gives the exact `exp(-d/l0)` profile, with phi about 0.96 on the line.
+- `B = 1e2` leaves phi at about 0.96 on the line. That remnant breaks under load and produces a small load dip before the peak, so keep `B = 1e3` unless the overshoot matters.
+- Check (SENB, a/W = 0.5, AT2, hybrid spectral, plane strain, h = l0/3, the same mesh with the slit open or closed). Peak load per mm: geometric slit 21.8, `[[initial_history]]` 18.4 to 18.6 (all variants), LEFM about 16.8 (x1.17 for the mesh-inflated AT2 Gc: about 18.1). The diffuse crack matches the Griffith estimate. The slit overestimates because its tip has to nucleate a damage zone first. The diffuse crack is 5 to 20% stiffer than the slit (initial stiffness 52 to 59 vs 49.5), so compare compliance with care.
 
 ## Results
 
@@ -192,7 +220,7 @@ The force-displacement CSV records `step`, `load_factor`, `applied_ux`/`applied_
 ## Numerical and operational notes
 
 - Inspect the `converged` column and solver log before interpreting a result. With `max_subdivs = 0`, the driver can accept unconverged increments; their history-field updates can affect later crack evolution. Filtering CSV rows cannot repair that history.
-- Initial damage assignments set the starting state; they do not impose a permanently pinned crack.
+- `[[initial_phi]]` assignments set the starting state; they do not impose a permanently pinned crack, and with `irreversibility = "history"` they heal on the first solve. Use `[[initial_history]]` for a pre-crack that persists.
 - The hybrid formulation does not implement the additional compression constraint that resets damage where negative energy exceeds positive energy. Account for this limitation in compression/contact-dominated cases.
 - Check mesh resolution relative to `l0`, load-step sensitivity, and solver convergence for each problem. This README does not establish benchmark accuracy.
 - If Windows exits immediately with `0xC0000135`, check the Gmsh and compiler runtime DLLs beside the executable.

@@ -12,6 +12,8 @@
 
 #include <Eigen/Dense>
 
+#include <array>
+#include <string>
 #include <vector>
 
 struct FemInput {
@@ -142,4 +144,18 @@ struct FemInput {
         double value = 0.0;
     };
     std::vector<InitialPhiNode> initial_phi_nodes;
+
+    // -----------------------------------------------------------------------
+    // Initial cracks seeded through the history field (resolved from
+    // [[initial_history]] specs, see fem::InitialHistorySpec)
+    // -----------------------------------------------------------------------
+    // Each crack is a set of straight segments {x0, y0, x1, y1}. History.cpp
+    // (seedInitialCrackHistory) raises H at every Gauss point near them.
+    struct InitialCrack {
+        std::string                        label;       // for log messages
+        std::vector<std::array<double, 4>> segments;
+        double                             B          = 1.0e3;
+        double                             half_width = 0.0;  // <= 0 -> l0/4
+    };
+    std::vector<InitialCrack> initial_cracks;
 };

@@ -542,6 +542,96 @@ FemInput readFemInputFromGmsh(const FemSpec& spec)
         gmshFree(nTags); gmshFree(nCoord);
     }
 
+    // ----- 7b. Initial cracks through the history field ---------------------
+    // Each InitialHistorySpec becomes one FemInput::InitialCrack: a list of
+    // straight segments built from the line elements of a 1D physical group
+    // (end nodes only, so Line3 is treated as straight) and/or from the
+    // explicit polyline in the config. History.cpp seeds H from them.
+    for (std::size_t c = 0; c < spec.initial_history.size(); ++c) {
+        const auto& ih = spec.initial_history[c];
+        FemInput::InitialCrack crack;
+        crack.B          = ih.B;
+        crack.half_width = ih.half_width;
+        crack.label      = ih.physical_name.empty()
+                               ? "initial_history[" + std::to_string(c) + "]"
+                               : ih.physical_name;
+
+        if (!ih.physical_name.empty()) {
+            const int phys_tag = find_physical_tag(1, ih.physical_name);
+            if (phys_tag < 0)
+                throw std::runtime_error(
+                    "1D physical group not found (initial_history): "
+                    + ih.physical_name);
+
+            int*        entTags   = nullptr;
+            std::size_t entTags_n = 0;
+            gmshModelGetEntitiesForPhysicalGroup(1, phys_tag, &entTags,
+                                                 &entTags_n, &ierr);
+            check_ierr(ierr,
+                "gmshModelGetEntitiesForPhysicalGroup (initial_history)");
+
+            for (std::size_t e = 0; e < entTags_n; ++e) {
+                int*          eTypes  = nullptr; std::size_t eTypes_n  = 0;
+                std::size_t** eTags   = nullptr; std::size_t* eTags_nn = nullptr;
+                                                 std::size_t eTags_n   = 0;
+                std::size_t** eNT     = nullptr; std::size_t* eNT_nn   = nullptr;
+                                                 std::size_t eNT_n     = 0;
+                gmshModelMeshGetElements(&eTypes, &eTypes_n,
+                                         &eTags, &eTags_nn, &eTags_n,
+                                         &eNT,   &eNT_nn,   &eNT_n,
+                                         /*dim=*/1, entTags[e], &ierr);
+                check_ierr(ierr,
+                    "gmshModelMeshGetElements (initial_history, per entity)");
+
+                for (std::size_t ti = 0; ti < eTypes_n; ++ti) {
+                    const int nnode = nnode_for_line_type(eTypes[ti]);
+                    if (nnode == 0) {
+                        std::cerr << "Warning: ignoring " << eTags_nn[ti]
+                                  << " line elements of gmsh type "
+                                  << eTypes[ti] << " on initial_history group \""
+                                  << ih.physical_name
+                                  << "\" (supported: Line2, Line3)\n";
+                        continue;
+                    }
+                    const std::size_t* gconn = eNT[ti];
+                    for (std::size_t k = 0; k < eTags_nn[ti]; ++k) {
+                        // gmsh orders the two END nodes first for Line2/Line3.
+                        int ends[2];
+                        for (int j = 0; j < 2; ++j) {
+                            const auto it = tag_to_id.find(gconn[k * nnode + j]);
+                            if (it == tag_to_id.end())
+                                throw std::runtime_error(
+                                    "initial_history edge references unknown "
+                                    "node tag");
+                            ends[j] = it->second;
+                        }
+                        crack.segments.push_back({d.coord(ends[0], 0),
+                                                  d.coord(ends[0], 1),
+                                                  d.coord(ends[1], 0),
+                                                  d.coord(ends[1], 1)});
+                    }
+                }
+
+                gmshFree(eTypes);
+                for (std::size_t ti = 0; ti < eTags_n; ++ti) gmshFree(eTags[ti]);
+                gmshFree(eTags); gmshFree(eTags_nn);
+                for (std::size_t ti = 0; ti < eNT_n;   ++ti) gmshFree(eNT[ti]);
+                gmshFree(eNT); gmshFree(eNT_nn);
+            }
+            gmshFree(entTags);
+        }
+
+        for (std::size_t k = 0; k + 1 < ih.points.size(); ++k)
+            crack.segments.push_back({ih.points[k][0],     ih.points[k][1],
+                                      ih.points[k + 1][0], ih.points[k + 1][1]});
+
+        if (crack.segments.empty())
+            throw std::runtime_error(
+                "initial_history '" + crack.label
+                + "': no crack segments found (is the 1D group meshed?)");
+        d.initial_cracks.push_back(std::move(crack));
+    }
+
     // Precompute the reference-element tables, now that the connectivity (and
     // therefore the set of element types present) is final. One entry per
     // distinct nnode; the Gauss-point loops read shape functions, reference
