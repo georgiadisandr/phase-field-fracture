@@ -161,7 +161,7 @@ H_c   = Gc / (2 l0)      (AT2: phi = B/(1+B) on the line)
 H_c   = 3 Gc / (16 l0)   (AT1: phi = 1 - 1/B on the line)
 ```
 
-where `d` is the distance from a Gauss point to the crack line. Before the first load step the phase field is solved once at zero load, so the crack exists with its smooth profile from step 0. Its crack energy is printed and used as the starting value of the dissipation bookkeeping. Because `H0` enters the driving force `max(H, psi+)` on every solve, the crack cannot heal, in both `irreversibility` modes. (By contrast, `[[initial_phi]]` only holds with `irreversibility = "bounds"`.)
+where `d` is the distance from a Gauss point to the crack line. Before the first load step the phase field is solved once at zero load, so the crack exists with its smooth profile from step 0. Its crack energy is printed. Because `H0` enters the driving force `max(H, psi+)` on every solve, the crack cannot heal, in both `irreversibility` modes. (By contrast, `[[initial_phi]]` only holds with `irreversibility = "bounds"`.)
 
 ```toml
 [[initial_history]]

@@ -485,26 +485,18 @@ void loadRunSection(const toml::table& root, AppConfig& cfg)
     if (readScalar<int64_t>(*tbl, "max_subdivs", msd))
         cfg.step.max_subdivs = static_cast<int>(msd);
 
-    // Load control: "displacement" (default) or "dissipation".
+    // The load is always displacement controlled. Dissipation control was
+    // removed; an old config that still asks for it stops here rather than
+    // silently running a different analysis. "displacement" is accepted.
     std::string lc;
     if (readString(*tbl, "load_control", lc)) {
         for (auto& c : lc) c = static_cast<char>(std::tolower(c));
-        if (lc == "displacement")
-            cfg.step.load_control = LoadControl::Displacement;
-        else if (lc == "dissipation")
-            cfg.step.load_control = LoadControl::Dissipation;
-        else
+        if (lc != "displacement")
             throw std::runtime_error(
-                "run.load_control must be \"displacement\" or \"dissipation\" "
-                "(got \"" + lc + "\")");
+                "run.load_control = \"" + lc + "\" is not supported: "
+                "dissipation control has been removed from this code. Delete "
+                "load_control (and the dissipation_* keys) from [run].");
     }
-    readDouble(*tbl, "dissipation_step",       cfg.step.dissipation_step);
-    readDouble(*tbl, "dissipation_switch",     cfg.step.dissipation_switch);
-    readDouble(*tbl, "dissipation_max_du",     cfg.step.dissipation_max_du);
-    readDouble(*tbl, "dissipation_tol",        cfg.step.dissipation_tol);
-    int64_t dms = 0;
-    if (readScalar<int64_t>(*tbl, "dissipation_max_steps", dms))
-        cfg.step.dissipation_max_steps = static_cast<int>(dms);
 
     // Output controls.
     readString(*tbl, "output_dir", cfg.output_dir);
@@ -685,29 +677,6 @@ void validate(const AppConfig& cfg)
                     "run.u_switch2 must be > run.u_switch in three_stage mode "
                     "(the second stage would otherwise have zero width)");
         }
-    }
-    if (cfg.step.load_control == LoadControl::Dissipation) {
-        if (cfg.step.dissipation_step <= 0.0)
-            throw std::invalid_argument(
-                "run.dissipation_step (dtau) must be > 0 when "
-                "run.load_control = \"dissipation\"");
-        // Staggered: crack-energy constraint, u = lambda*u_hat -> hybrid.
-        // Monolithic: energy-balance constraint on the bordered Newton
-        // system -> any formulation, but no phi bounds (hence no AT1).
-        if (cfg.solver.scheme == pfm::SolverScheme::Staggered && !cfg.fem.hybrid)
-            throw std::invalid_argument(
-                "run.load_control = \"dissipation\" with the staggered scheme "
-                "needs fem.hybrid = true (the u-sub-problem must be linear in "
-                "the load factor)");
-        if (cfg.solver.scheme == pfm::SolverScheme::Monolithic &&
-            cfg.solver.phi_bounds != pfm::PhiBounds::None)
-            throw std::invalid_argument(
-                "run.load_control = \"dissipation\" with the monolithic scheme "
-                "does not support solver.phi_bounds (use the staggered scheme)");
-        if (cfg.step.dissipation_max_steps <= 0)
-            throw std::invalid_argument("run.dissipation_max_steps must be > 0");
-        if (cfg.step.dissipation_tol <= 0.0)
-            throw std::invalid_argument("run.dissipation_tol must be > 0");
     }
     if (cfg.fem.crack_model == pfm::CrackModel::AT1 &&
         cfg.solver.scheme != pfm::SolverScheme::Staggered)

@@ -2,10 +2,32 @@
 """
 Set up, run and watch a phase-field solve.
 
-THIRD ITERATION. run_gui.py is the untouched original and run_gui2.py is the
-previous working version.  This file is the visual/interaction refinement, so
-all three can be compared and an earlier version can be run if something
-regresses.
+FOURTH ITERATION, branched from run_gui2.py. run_gui.py is the untouched
+original, run_gui2.py is the previous working version, and
+run_gui3_presets_branch.py is the older third iteration (presets, recent
+configs, log tools) kept for reference. Nothing here alters any of them.
+
+WHAT IS NEW HERE
+    ENERGY / CONVERGENCE VIEW. The solver has always written a
+    <base>_stagger_energy.csv -- one row per staggered SWEEP, carrying
+    E_total, E_elastic, E_fracture and the residual norm -- and nothing ever
+    read it. On one 8,040-step run that is 79,646 rows of exactly the
+    diagnostic you want when a solve is not converging, sitting unopened
+    beside the results. It answers two questions no other view can:
+
+      how hard is each step working   sweeps used per step against the
+                                      max_staggered ceiling. On that run
+                                      7,929 of 8,040 steps hit the cap.
+      where is the energy going       elastic storage handing over to
+                                      fracture dissipation as the crack
+                                      runs -- and E_fracture / Gc is the
+                                      crack length the model has paid for,
+                                      which you can compare with the one on
+                                      screen.
+
+    MESH FOUND BESIDE THE RESULTS. The solver copies the mesh into the run
+    folder, so the notch and mesh overlays no longer depend on the mesh path
+    box being filled in by hand -- opening an old run just works.
 
     pip install matplotlib
     python run_gui3.py
@@ -38,14 +60,14 @@ import math
 import os
 import queue
 import re
-import signal
 import shutil
+import signal
 import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, ttk
 from tkinter import font as tkfont
 
 import matplotlib
@@ -54,13 +76,13 @@ from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
                                                NavigationToolbar2Tk)
 from matplotlib.figure import Figure
 from matplotlib.collections import PolyCollection, LineCollection
+from matplotlib.colors import Normalize, TwoSlopeNorm
+from matplotlib.ticker import MaxNLocator
 import matplotlib.tri as mtri
 import matplotlib.patheffects as mpe
 import numpy as np
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-GUI_STATE = os.path.join(PROJECT_DIR, ".phasefield_gui3_state.json")
-MAX_RECENT_CONFIGS = 8
 
 
 # ---------------------------------------------------------------------------
@@ -189,8 +211,6 @@ def child_env():
     env = dict(os.environ)
     env["PYTHONUNBUFFERED"] = "1"
     return env
-
-
 def process_group_kwargs():
     """Start tools in their own process group so Stop can include children."""
     if os.name == "nt":
@@ -229,6 +249,8 @@ def signal_process_tree(proc, hard=False):
             proc.kill() if hard else proc.terminate()
         except OSError:
             pass
+
+
 # Per PROCESS, so two GUI windows can run at once. Both used to write the same
 # _gui_run.toml and hand that one filename to the solver, so launching a second
 # run while the first was starting could silently give it the other window's
@@ -261,9 +283,6 @@ POLL_MS = LOG_POLL_MS        # the main tick interval
 # Kept well under LOG_POLL_MS so the drain can never monopolise the event loop.
 DRAIN_MS = 10
 LOG_LINES = 400
-# Keep a larger plain-text history for Save even though the on-screen widget is
-# trimmed aggressively for responsiveness.
-LOG_HISTORY_CHARS = 5_000_000
 # Most converged-step markers drawn at once. Above this they are thinned by a
 # stride (and the legend says so); non-converged markers are always drawn in
 # full, however many there are.
@@ -284,6 +303,84 @@ MESH_DETAIL_LIMIT = 60_000
 #   size map   ALWAYS the size map, even on a small mesh, which is the quickest
 #              way to check a refinement is where you asked for it.
 MESH_VIEWS = ["auto", "elements", "size map"]
+
+# What to draw over the phi contour on the Crack tab.
+#
+# Everything is CULLED TO THE VISIBLE AXES and skipped entirely above the
+# limits below. Drawing 340k element outlines over a contour is not a
+# comparison, it is a grey rectangle on top of the answer -- and it is the
+# zoomed-in view, at the crack tip, where the question is actually asked.
+CRACK_OVERLAYS = ["none", "nodes", "elements", "nodes + elements"]
+# Elements in view above which the outlines are dropped (they would be
+# sub-pixel), and nodes in view above which the dots are dropped.
+CRACK_ELEM_LIMIT = 25_000
+CRACK_NODE_LIMIT = 12_000
+
+# Everything writeVTK() puts in a snapshot, and how each one has to be drawn.
+#
+#   where   "point" values live on nodes and are CONTOURED; "cell" values are
+#           one number per element and are drawn FLAT, one colour per element.
+#           That distinction is not cosmetic. Output.cpp integrates the
+#           stresses over each element's Gauss points and says so: "in ParaView
+#           each cell shows a single (flat) value, which matches how the
+#           quantity is integrated." Smoothing them onto nodes to get a pretty
+#           contour would invent a continuity the solver never claimed.
+#   signed  fields that cross zero. They get a DIVERGING map centred on zero,
+#           which is the exact opposite of the rule for phi below -- for a
+#           quantity that goes negative, the middle of the range IS the
+#           meaningful place to put the neutral colour.
+CRACK_FIELDS = {
+    "phi":       {"block": "SCALARS phi",         "where": "point",
+                  "comp": None,  "signed": False, "unit": ""},
+    "|u|":       {"block": "VECTORS displacement", "where": "point",
+                  "comp": "mag", "signed": False, "unit": "mm"},
+    "ux":        {"block": "VECTORS displacement", "where": "point",
+                  "comp": 0,     "signed": True,  "unit": "mm"},
+    "uy":        {"block": "VECTORS displacement", "where": "point",
+                  "comp": 1,     "signed": True,  "unit": "mm"},
+    "sigma_xx":  {"block": "SCALARS sigma_xx",    "where": "cell",
+                  "comp": None,  "signed": True,  "unit": "MPa"},
+    "sigma_yy":  {"block": "SCALARS sigma_yy",    "where": "cell",
+                  "comp": None,  "signed": True,  "unit": "MPa"},
+    "sigma_xy":  {"block": "SCALARS sigma_xy",    "where": "cell",
+                  "comp": None,  "signed": True,  "unit": "MPa"},
+    "von_mises": {"block": "SCALARS von_mises",   "where": "cell",
+                  "comp": None,  "signed": False, "unit": "MPa"},
+}
+
+# Displacement magnification for the Crack view.
+#
+# "auto" scales so the largest displacement is AUTO_DEFORM_FRACTION of the
+# specimen diagonal, which is the only setting that works without knowing the
+# specimen: u_max here is 0.12 mm on a part measured in millimetres, so x1 is
+# invisible and x100 is a cartoon, and which of those you want depends
+# entirely on the geometry you loaded.
+# How the Energy tab arranges its three panels.
+#
+# "DEFAULT" IS THE ONE YOU GET ON OPENING: the energy split gets a full-height
+# panel of its own on the left, and the two diagnostics stack in a column
+# beside it.
+# That suits the pane, which is wider than it is tall, and it keeps the pairing
+# that matters -- sweeps and residual still share one x-axis with each other,
+# so "did this step run out of sweeps, and was its residual still falling"
+# stays a single vertical glance. All three are linked for pan and zoom
+# regardless, so moving one moves the others.
+#
+# Stacked puts all three on one shared axis, which is the strictest reading of
+# the same idea and the right choice in a tall pane. Side by side suits a wide
+# short one. The single views exist because sometimes you want one panel and
+# it may as well have everything.
+ENERGY_VIEWS = ["default", "stacked", "side by side",
+                "energy", "sweeps", "residual"]
+
+CRACK_SHAPES = ["undeformed", "auto", "x1", "x2", "x5", "x10", "x20", "x50",
+                "x100", "x500"]
+AUTO_DEFORM_FRACTION = 0.06
+
+# Diverging maps, offered only for the signed fields. Their neutral colour
+# sits in the MIDDLE, which is wrong for phi and right for a stress.
+DIVERGING = ["coolwarm", "RdBu_r", "seismic", "bwr", "PuOr_r", "BrBG_r",
+             "Spectral_r"]
 
 # Colour maps offered for the phi contour. All SEQUENTIAL: phi runs 0 -> 1 from
 # intact to fully broken, so the colours must too. A diverging map (coolwarm and
@@ -320,14 +417,17 @@ DARK = {
     "fg": "#c5c8cd", "muted": "#868b92", "accent": "#6f9ed4",
     "warn": "#bd8f52", "err": "#cf6b6b", "grid": "#3a3d42", "line": "#5ac8fa",
     "warnbg": "#2a2620",
+    # accent_hi is the accent under the pointer; onaccent is what stays
+    # readable ON the accent -- picked per theme because a light accent needs
+    # dark text and a dark one needs light, and getting that pair wrong is how
+    # a primary button ends up unreadable in one theme only.
+    "accent_hi": "#8ab4e8", "onaccent": "#0d1117", "errbg": "#2e2022",
     # Softer lines. "grid" was doing double duty as the section outline AND
     # the field border, which made a row of seven entries read as a cage.
-    "accent_hi": "#8ab4e8", "onaccent": "#0d1117", "errbg": "#2e2022",
     "edge": "#33363b", "outline": "#2c2f34", "cell": "#2b2e33",
     # Mesh view: near-white wireframe on a face darker than the panel, so the
     # elements read as a mesh rather than as texture.
     "mesh_edge": "#dfe6ee", "mesh_face": "#15171a",
-    "success": "#5fc98b",
 }
 LIGHT = {
     "bg": "#f0f0f0", "panel": "#e4e4e4", "field": "#ffffff", "hover": "#d8d8d8",
@@ -337,7 +437,6 @@ LIGHT = {
     "accent_hi": "#0b6ac9", "onaccent": "#ffffff", "errbg": "#fdeaea",
     "edge": "#c4c4c4", "outline": "#d2d2d2", "cell": "#fbfbfb",
     "mesh_edge": "#222222", "mesh_face": "#ffffff",
-    "success": "#167447",
 }
 T = DARK          # active palette; swapped by --light before the window is built
 
@@ -365,22 +464,6 @@ def apply_theme(root: tk.Tk) -> None:
                     focuscolor=T["accent"])
     style.configure("TFrame", background=T["bg"])
     style.configure("TLabel", background=T["bg"], foreground=T["fg"])
-    style.configure("Title.TLabel", background=T["bg"], foreground=T["fg"],
-                    font=("TkDefaultFont", 17, "bold"))
-    style.configure("Subtitle.TLabel", background=T["bg"],
-                    foreground=T["muted"], font=("TkDefaultFont", 9))
-    style.configure("SectionHint.TLabel", background=T["bg"],
-                    foreground=T["muted"], font=("TkDefaultFont", 8))
-    style.configure("Good.TLabel", background=T["bg"],
-                    foreground=T["success"], font=("TkDefaultFont", 9, "bold"))
-    style.configure("Warning.TLabel", background=T["bg"],
-                    foreground=T["warn"], font=("TkDefaultFont", 9, "bold"))
-    style.configure("Status.TLabel", background=T["panel"], foreground=T["fg"],
-                    padding=[px(10), px(7)], font=("TkDefaultFont", 10, "bold"))
-    style.configure("Activity.TLabel", background=T["bg"], foreground=T["accent"],
-                    font=("TkDefaultFont", 10, "bold"))
-    style.configure("RunDetail.TLabel", background=T["bg"], foreground=T["fg"],
-                    font=("TkFixedFont", 9))
     style.configure("TLabelframe", background=T["bg"],
                     bordercolor=T["outline"], lightcolor=T["outline"],
                     darkcolor=T["outline"])
@@ -400,6 +483,11 @@ def apply_theme(root: tk.Tk) -> None:
               bordercolor=[("active", T["grid"])],
               lightcolor=[("active", T["grid"])],
               darkcolor=[("active", T["grid"])])
+
+    # The one button that commits you to an hours-long solve should not be
+    # drawn identically to the "..." that opens a file dialog beside it. Run
+    # takes the accent as a fill; everything else stays the flat grey above,
+    # so there is exactly one loud control in the window.
     style.configure("Primary.TButton", background=T["accent"],
                     foreground=T["onaccent"], bordercolor=T["accent"],
                     lightcolor=T["accent"], darkcolor=T["accent"],
@@ -413,6 +501,11 @@ def apply_theme(root: tk.Tk) -> None:
               bordercolor=[("active", T["accent_hi"]), ("disabled", T["edge"])],
               lightcolor=[("active", T["accent_hi"]), ("disabled", T["edge"])],
               darkcolor=[("active", T["accent_hi"]), ("disabled", T["edge"])])
+
+    # Stop kills a solve that may be hours in, so it is marked -- but in its
+    # TEXT only. A red fill sitting next to the blue Run would read as an
+    # error state permanently present in the toolbar; the fill appears only
+    # under the pointer, at the moment it is about to be pressed.
     style.configure("Danger.TButton", background=T["panel"],
                     foreground=T["err"], bordercolor=T["edge"],
                     lightcolor=T["edge"], darkcolor=T["edge"],
@@ -424,27 +517,19 @@ def apply_theme(root: tk.Tk) -> None:
               bordercolor=[("active", T["err"])],
               lightcolor=[("active", T["err"])],
               darkcolor=[("active", T["err"])])
-    style.configure("Tool.TButton", padding=px(4), font=("TkDefaultFont", 9))
-    style.configure("Section.TButton", background=T["panel"], foreground=T["fg"],
-                    bordercolor=T["outline"], lightcolor=T["outline"],
-                    darkcolor=T["outline"], anchor="w", relief="flat",
-                    padding=[px(9), px(6)], font=("TkDefaultFont", 9, "bold"))
+
+    # A section heading that is also its own toggle. Left-aligned and flat,
+    # so it reads as a heading rather than as another control competing with
+    # Run -- the only thing that marks it as pressable is that it lights up
+    # under the pointer.
+    style.configure("Section.TButton", background=T["panel"],
+                    foreground=T["fg"], bordercolor=T["outline"],
+                    lightcolor=T["outline"], darkcolor=T["outline"],
+                    anchor="w", relief="flat", padding=[px(9), px(6)],
+                    font=("TkDefaultFont", 9, "bold"))
     style.map("Section.TButton",
               background=[("active", T["hover"])],
               foreground=[("active", T["fg"])])
-    style.configure("Summary.TFrame", background=T["panel"])
-    style.configure("SummaryTitle.TLabel", background=T["panel"],
-                    foreground=T["accent"], font=("TkDefaultFont", 9, "bold"))
-    style.configure("SummaryText.TLabel", background=T["panel"],
-                    foreground=T["fg"], font=("TkDefaultFont", 9))
-    style.configure("Invalid.TEntry", fieldbackground=T["field"],
-                    foreground=T["fg"], insertcolor=T["fg"],
-                    bordercolor=T["err"], lightcolor=T["err"],
-                    darkcolor=T["err"], borderwidth=2)
-    style.configure("Invalid.TCombobox", fieldbackground=T["field"],
-                    foreground=T["fg"], background=T["panel"],
-                    arrowcolor=T["fg"], bordercolor=T["err"],
-                    lightcolor=T["err"], darkcolor=T["err"], borderwidth=2)
 
     # Table cells: flush, flat, dim border. Same reasoning as the buttons --
     # the bevel is what made a row of entries look like a cage.
@@ -479,8 +564,14 @@ def apply_theme(root: tk.Tk) -> None:
     style.map("TCheckbutton",
               background=[("active", T["bg"])],
               indicatorcolor=[("selected", T["accent"])])
-    # Tabs are navigation rather than actions.  The selected tab joins the
-    # content area and uses an accent label, matching the calmer gui2 design.
+    # Tabs are navigation, not a call to action. The selected one used to be
+    # a solid accent fill with black text at 10pt bold -- which made the
+    # loudest object in the window a label telling you which view you are
+    # already looking at, competing with Run for the same attention.
+    #
+    # Now the selected tab takes the CONTENT's background, so it reads as the
+    # front sheet of a stack rather than a highlighted button, and only its
+    # text is accented. Unselected tabs sit back on the panel colour.
     style.configure("TNotebook", background=T["bg"], bordercolor=T["grid"],
                     tabmargins=[px(2), px(6), px(2), 0])
     style.configure("TNotebook.Tab", background=T["panel"],
@@ -533,6 +624,26 @@ def add_toolbar(canvas, parent):
             tb._message_label.config(background=T["bg"], foreground=T["fg"])
     except tk.TclError:
         pass
+
+    # THE CHECKERBOARD SQUARE in the middle of the toolbar. matplotlib
+    # DISABLES Back and Forward whenever there is no view history to move
+    # through, and Tk draws a disabled image button by masking the image with
+    # a 50% stipple. On the light default theme that reads as a greyed-out
+    # arrow; against this dark strip it is every other pixel of a white icon
+    # on near-black, which is a checkerboard.
+    #
+    # There is no Tk option for the stipple, so the choice is between the
+    # artefact and the affordance. Both buttons are no-ops on an empty
+    # history, so nothing can go wrong by pressing one, and a blank-looking
+    # button is a worse signal than an inert one.
+    try:
+        tb.set_history_buttons = lambda: None      # stop it re-disabling them
+        for name in ("Back", "Forward"):
+            button = getattr(tb, "_buttons", {}).get(name)
+            if button is not None:
+                button.configure(state="normal")
+    except (AttributeError, tk.TclError):
+        pass
     return tb
 
 
@@ -550,9 +661,13 @@ def style_axes(fig, ax) -> None:
 
 
 SPLITS = ["none", "lancioni", "amor", "spectral"]
+CRACK_MODELS = ["AT2", "AT1"]   # fem.crack_model
 SCHEMES = ["staggered", "monolithic"]
 STAGGER_STOPS = ["energy", "residual"]
 STEP_MODES = ["two_stage", "three_stage", "uniform"]
+# solver.phi_bounds / solver.irreversibility (staggered only) -- see config.toml
+PHI_BOUNDS = ["none", "active_set"]
+IRREVERSIBILITY = ["history", "bounds"]
 NTYPES = {"plane stress": 1, "plane strain": 2}
 
 # ---------------------------------------------------------------------------
@@ -727,30 +842,39 @@ DEFAULTS = {
     "bcs": [],
     "scheme": "staggered", "stagger_stop": "energy", "max_staggered": 20,
     "gamma_tol": 10.0, "tol_rel": 1e-6, "tol_abs": 1e-8, "max_iter": 100,
+    "phi_bounds": "none", "irreversibility": "history", "crack_model": "AT2",
+    "phi_active_set_max_iter": 50,
     "step_mode": "two_stage", "N_steps": 20, "du": 1e-4, "du_coarse": 1e-3,
     "u_switch": 0.02, "du_fine": 1e-4,
     "u_switch2": 0.0, "du_final": 0.0, "max_subdivs": 4,
     "output_dir": ".", "vtk_every": 10, "profile_every": 0, "write_log": True,
+    # [[initial_history]]: one pre-crack seeded through the history field.
+    # Further entries of an imported config ride along untouched in ih_extra.
+    "ih_on": False, "ih_points": "", "ih_group": "", "ih_B": 1000.0,
+    "ih_half_width": 0.0, "ih_extra": [],
 }
 
-# Presets intentionally touch solver/run controls only.  Specimen geometry,
-# material values and boundary conditions remain the user's model.
-BUILTIN_PRESETS = {
-    "Robust staggered": {
-        "scheme": "staggered", "stagger_stop": "energy",
-        "max_staggered": 30, "max_subdivs": 4,
-        "tol_rel": 1e-6, "tol_abs": 1e-8,
-    },
-    "Fast preview": {
-        "scheme": "staggered", "stagger_stop": "energy",
-        "max_staggered": 10, "max_subdivs": 1,
-        "vtk_every": 25, "profile_every": 0,
-    },
-    "Monolithic": {
-        "scheme": "monolithic", "max_subdivs": 4,
-        "tol_rel": 1e-6, "tol_abs": 1e-8, "max_iter": 100,
-    },
-}
+
+def parse_crack_points(text: str) -> list[list[float]]:
+    """Crack polyline from free text: '44 8; 44 10', '44,8 44,10' or the TOML
+    form '[[44.0, 8.0], [44.0, 10.0]]' all work -- the numbers are read in
+    order and paired as (x, y). Raises ValueError on an odd count."""
+    nums = re.findall(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?",
+                      text or "")
+    if len(nums) % 2:
+        raise ValueError("crack points need x, y pairs -- got an odd count "
+                         f"of numbers ({len(nums)})")
+    v = [float(x) for x in nums]
+    return [[v[i], v[i + 1]] for i in range(0, len(v), 2)]
+
+
+def _points_text(pts) -> str:
+    return "; ".join(f"{_fmt_pt(p[0])} {_fmt_pt(p[1])}" for p in pts)
+
+
+def _fmt_pt(x) -> str:
+    r = repr(float(x))
+    return r[:-2] if r.endswith(".0") else r
 
 
 def config_to_form(cfg: dict) -> dict:
@@ -766,6 +890,7 @@ def config_to_form(cfg: dict) -> dict:
     f["ngaus"] = int(fem.get("ngaus", 2))
     f["energy_split"] = fem.get("energy_split", "spectral")
     f["hybrid"] = bool(fem.get("hybrid", True))
+    f["crack_model"] = str(fem.get("crack_model", "AT2")).upper()
 
     mats = cfg.get("materials") or []
     if mats:
@@ -805,6 +930,9 @@ def config_to_form(cfg: dict) -> dict:
     f["tol_rel"] = float(sol.get("tol_rel", 1e-6))
     f["tol_abs"] = float(sol.get("tol_abs", 1e-8))
     f["max_iter"] = int(sol.get("max_iter", 100))
+    f["phi_bounds"] = sol.get("phi_bounds", "none")
+    f["irreversibility"] = sol.get("irreversibility", "history")
+    f["phi_active_set_max_iter"] = int(sol.get("phi_active_set_max_iter", 50))
 
     f["step_mode"] = run.get("step_mode", "two_stage")
     f["N_steps"] = int(run.get("N_steps", 20))
@@ -819,6 +947,16 @@ def config_to_form(cfg: dict) -> dict:
     f["vtk_every"] = int(run.get("vtk_every", 10))
     f["profile_every"] = int(run.get("profile_every", 0))
     f["write_log"] = bool(run.get("write_log", True))
+
+    ihs = cfg.get("initial_history") or []
+    if ihs:
+        ih = ihs[0]
+        f["ih_on"] = True
+        f["ih_points"] = _points_text(ih.get("points") or [])
+        f["ih_group"] = ih.get("physical_name", "")
+        f["ih_B"] = float(ih.get("B", 1000.0))
+        f["ih_half_width"] = float(ih.get("half_width", 0.0))
+        f["ih_extra"] = [dict(x) for x in ihs[1:]]
     return f
 
 
@@ -873,7 +1011,7 @@ def form_to_toml(f: dict) -> str:
     """Serialise the form to a run config. Written by hand rather than with a
     TOML library so there is no extra dependency and the output stays readable
     -- you are meant to be able to open this file and see what ran."""
-    L = ["# Generated by run_gui3.py -- edit the GUI, not this file.",
+    L = ["# Generated by run_gui2.py -- edit the GUI, not this file.",
          f"# {time.strftime('%Y-%m-%d %H:%M:%S')}", "",
          "[mesh]",
          f'source    = ' + _str(f["mesh_source"])]
@@ -886,7 +1024,8 @@ def form_to_toml(f: dict) -> str:
           f'ngaus        = {int(f["ngaus"])}',
           "nstre        = 3",
           f'energy_split = ' + _str(f["energy_split"]),
-          f'hybrid       = {_num(bool(f["hybrid"]))}', "",
+          f'hybrid       = {_num(bool(f["hybrid"]))}',
+          f'crack_model  = ' + _str(f.get("crack_model", "AT2")), "",
           "[[materials]]",
           f'name  = ' + _str(f["mat_name"]),
           "props = [ " + ", ".join(_num(float(f[k]))
@@ -920,6 +1059,34 @@ def form_to_toml(f: dict) -> str:
               f'traction      = [{_num(float(b["vx"]))}, {_num(float(b["vy"]))}]',
               ""]
 
+    if f.get("ih_on"):
+        try:
+            pts = parse_crack_points(f.get("ih_points", ""))
+        except ValueError:
+            pts = []                    # validate_form reports it
+        L += ["[[initial_history]]   # pre-crack through the history field"]
+        if str(f.get("ih_group", "")).strip():
+            L.append('physical_name = ' + _str(str(f["ih_group"]).strip()))
+        if pts:
+            L.append("points     = [" + ", ".join(
+                f"[{_num(p[0])}, {_num(p[1])}]" for p in pts) + "]")
+        L += [f'B          = {_num(float(f["ih_B"]))}',
+              f'half_width = {_num(float(f["ih_half_width"]))}'
+              + '   # mm, 0 = l0/4', ""]
+    # Further cracks of an imported config, written back as they came.
+    for ih in (f.get("ih_extra") or []):
+        L.append("[[initial_history]]")
+        if ih.get("physical_name"):
+            L.append('physical_name = ' + _str(ih["physical_name"]))
+        if ih.get("points"):
+            L.append("points     = [" + ", ".join(
+                f"[{_num(float(p[0]))}, {_num(float(p[1]))}]"
+                for p in ih["points"]) + "]")
+        for key in ("B", "half_width"):
+            if key in ih:
+                L.append(f"{key:<10} = {_num(float(ih[key]))}")
+        L.append("")
+
     L += ["[solver]",
           f'tol_rel               = {_num(float(f["tol_rel"]))}',
           f'tol_abs               = {_num(float(f["tol_abs"]))}',
@@ -928,7 +1095,13 @@ def form_to_toml(f: dict) -> str:
           f'scheme                = ' + _str(f["scheme"]),
           f'max_staggered         = {int(f["max_staggered"])}',
           f'stagger_stop          = ' + _str(f["stagger_stop"]),
-          f'stagger_gamma_tol_deg = {_num(float(f["gamma_tol"]))}', "",
+          f'stagger_gamma_tol_deg = {_num(float(f["gamma_tol"]))}']
+    # Written only when used, so an unconstrained config reads as before.
+    if f.get("phi_bounds", "none") != "none":
+        L += [f'phi_bounds            = ' + _str(f["phi_bounds"]),
+              f'irreversibility       = ' + _str(f.get("irreversibility", "history")),
+              f'phi_active_set_max_iter = {int(f["phi_active_set_max_iter"])}']
+    L += ["",
           "[run]",
           f'step_mode     = ' + _str(f["step_mode"]),
           f'du            = {_num(float(f["du"]))}'
@@ -940,8 +1113,8 @@ def form_to_toml(f: dict) -> str:
           f'u_switch2     = {_num(float(f["u_switch2"]))}'
           + '   # three_stage only',
           f'du_final      = {_num(float(f["du_final"]))}',
-          f'max_subdivs   = {int(f["max_subdivs"])}',
-          "show_gui      = false",
+          f'max_subdivs   = {int(f["max_subdivs"])}']
+    L += ["show_gui      = false",
           "preview_mesh  = false",
           f'output_dir    = ' + _str(f["output_dir"]),
           f'vtk_every     = {int(f["vtk_every"])}',
@@ -980,12 +1153,57 @@ def validate_form(f: dict) -> list[str]:
     if f["step_mode"] in ("two_stage", "three_stage") \
             and float(f["du_fine"]) > float(f["du_coarse"]):
         p.append("du_fine should be <= du_coarse (the fine stage is the refined one).")
+    if f.get("crack_model", "AT2") == "AT1" and f["scheme"] != "staggered":
+        p.append("crack_model = AT1 needs the staggered scheme (its bound "
+                 "phi >= 0 is enforced by the staggered phi active set).")
+    if f.get("phi_bounds", "none") != "none" and f["scheme"] != "staggered":
+        p.append("phi_bounds = active_set is implemented for the staggered "
+                 "scheme only.")
+    if f.get("irreversibility") == "bounds" and f.get("phi_bounds", "none") == "none":
+        p.append("irreversibility = bounds needs phi_bounds = active_set -- "
+                 "otherwise nothing prevents the crack from healing.")
+    if f.get("phi_bounds", "none") != "none" and int(f["phi_active_set_max_iter"]) <= 0:
+        p.append("phi_active_set_max_iter must be > 0.")
+    if f.get("ih_on"):
+        try:
+            pts = parse_crack_points(f.get("ih_points", ""))
+        except ValueError as exc:
+            p.append(f"Initial crack: {exc}.")
+            pts = None
+        group = str(f.get("ih_group", "")).strip()
+        if pts is not None and not group and len(pts) == 0:
+            p.append("Initial crack: give at least two points (x0 y0; x1 y1) "
+                     "or a 1D group name.")
+        if pts is not None and len(pts) == 1:
+            p.append("Initial crack: a single point is not a line -- give at "
+                     "least two.")
+        if float(f["ih_B"]) <= 0:
+            p.append("Initial crack: B must be > 0.")
+        if float(f["ih_half_width"]) < 0:
+            p.append("Initial crack: half_width must be >= 0 (0 = l0/4).")
     return p
 
 
 def warn_form(f: dict) -> list[str]:
     """Things that are legal but usually a mistake. Shown, not blocking."""
     w = []
+    if f.get("ih_on"):
+        try:
+            hw = float(f["ih_half_width"])
+            if 0 < hw < 0.2 * float(f["l0"]):
+                w.append("Initial crack: half_width < l0/5 may catch no Gauss "
+                         "point unless the mesh is very fine (the run stops "
+                         "with an error if none is caught).")
+            if float(f["ih_B"]) < 300:
+                w.append("Initial crack: B < ~300 leaves the line only "
+                         "partly broken (AT2: phi = B/(1+B) on it); the "
+                         "rest breaks under load and can show as a small "
+                         "pre-peak load dip.")
+        except (ValueError, KeyError, TypeError):
+            pass
+    if f.get("crack_model", "AT2") == "AT1" and f.get("phi_bounds", "none") == "none":
+        w.append("crack_model = AT1 needs phi >= 0: the solver will switch "
+                 "phi_bounds to active_set automatically.")
     if int(f["max_subdivs"]) == 0:
         w.append(
             "max_subdivs = 0 disables adaptive halving. A non-converged step is "
@@ -1243,6 +1461,78 @@ def csv_path_for(f: dict) -> str:
                         f["base_name"] + "_force_disp.csv")
 
 
+def stagger_path_for(f: dict) -> str:
+    """The per-sweep energy/residual log, beside the force-displacement CSV."""
+    if not f.get("base_name"):
+        return ""
+    return os.path.join(f.get("output_dir") or ".", f["base_name"],
+                        f["base_name"] + "_stagger_energy.csv")
+
+
+def run_mesh_for(f: dict) -> str:
+    """The copy of the mesh the solver leaves in its own output folder.
+
+    main.cpp writes <base>.msh beside the results, so a finished run already
+    carries the geometry it was computed on. That matters because the notch
+    outline and the mesh overlay come from a .msh, NOT from the snapshots --
+    and until now the only way to point at one was the mesh box in section 2.
+    Open a run from last week and that box is empty or still pointing at
+    whatever you meshed most recently, so both overlays drew nothing and said
+    nothing about why.
+    """
+    if not f.get("base_name"):
+        return ""
+    return os.path.join(f.get("output_dir") or ".", f["base_name"],
+                        f["base_name"] + ".msh")
+
+
+ARCHIVE_MIN_ROWS = 20     # below this a CSV is a false start, not a result
+
+
+def archive_curve(path: str) -> str:
+    """Move a finished run's force-displacement CSV aside. Returns the new name.
+
+    THE BUG THIS FIXES: re-running with a base_name that already exists simply
+    DELETED the previous curve. The only guard was the liveness check, which
+    asks whether another window is writing the file RIGHT NOW -- twenty
+    seconds of protection for a result that took eleven hours to produce. Once
+    the run had finished, starting another one with the same name destroyed it
+    without a word.
+
+    The VTK snapshots are overwritten by index and the log is rewritten, but
+    those are reproducible from the config. The force-displacement curve IS
+    the result, so it is the one file worth keeping, and keeping it costs a
+    rename and a few hundred kilobytes.
+
+    A file with almost nothing in it is a false start -- launch, notice a bad
+    setting, stop, launch again -- and archiving those would bury the real
+    ones, so they are still removed.
+    """
+    try:
+        with open(path, "r", errors="replace") as fh:
+            rows = sum(1 for _ in fh) - 1        # minus the header
+    except OSError:
+        rows = 0
+    if rows < ARCHIVE_MIN_ROWS:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return ""
+    stamp = time.strftime("%Y%m%d-%H%M%S",
+                          time.localtime(os.path.getmtime(path)))
+    root_, ext = os.path.splitext(path)
+    dest = f"{root_}.{stamp}{ext}"
+    i = 2
+    while os.path.exists(dest):
+        dest, i = f"{root_}.{stamp}-{i}{ext}", i + 1
+    try:
+        os.replace(path, dest)
+    except OSError:
+        return ""
+    return dest
+
+
 # ---------------------------------------------------------------------------
 # Crack view: reading the solver's per-step VTK snapshots
 #
@@ -1282,39 +1572,28 @@ _TIME_RE = re.compile(r"\[time\]\s+step\s+(\d+)\s*=\s*([0-9.]+)\s*s")
 RATE_WINDOW = 25
 
 
-def newest_vtk(vdir: str):
-    """(path, step) of the highest-numbered snapshot, or (None, -1).
+def list_vtk(vdir: str):
+    """Every snapshot as (step, path), ascending by STEP NUMBER.
 
-    Sorted by the STEP NUMBER parsed from the name, not by mtime or asciibetics:
-    setw(3) stops zero-padding at step 999, so "_step_1000.vtk" sorts before
-    "_step_999.vtk" as text.
+    Numerically, not asciibetically: setw(3) stops zero-padding at step 999,
+    so "_step_1000.vtk" sorts before "_step_999.vtk" as text -- which would
+    drop the whole end of a long run into the middle of the list, and step
+    backwards from frame 1000 to frame 100.
     """
     try:
         entries = os.listdir(vdir)
     except OSError:
-        return None, -1
-    best, best_step = None, -1
-    for name in entries:
-        m = _STEP_RE.search(name)
-        if m and int(m.group(1)) > best_step:
-            best_step = int(m.group(1))
-            best = os.path.join(vdir, name)
-    return best, best_step
-
-
-def vtk_snapshots(vdir: str):
-    """All VTK snapshots as sorted ``(step, path)`` pairs."""
-    try:
-        entries = os.listdir(vdir)
-    except OSError:
         return []
-    found = []
-    for name in entries:
-        m = _STEP_RE.search(name)
-        if m:
-            found.append((int(m.group(1)), os.path.join(vdir, name)))
-    found.sort(key=lambda item: item[0])
-    return found
+    out = [(int(m.group(1)), os.path.join(vdir, name))
+           for name, m in ((e, _STEP_RE.search(e)) for e in entries) if m]
+    out.sort(key=lambda kv: kv[0])
+    return out
+
+
+def newest_vtk(vdir: str):
+    """(path, step) of the highest-numbered snapshot, or (None, -1)."""
+    snaps = list_vtk(vdir)
+    return (snaps[-1][1], snaps[-1][0]) if snaps else (None, -1)
 
 
 def _header(lines, keyword):
@@ -1330,11 +1609,30 @@ def _floats(lines, a, b):
 
 
 def read_vtk_geometry(path: str):
-    """-> (Triangulation, npoin). Quads are split into two triangles.
+    """-> (Triangulation, npoin, polys). Quads are split into two triangles.
 
     tricontourf needs a triangulation; the solver's elements are quads. Corner
     nodes only for Q8 -- VTK's Q8 ordering puts the four corners first, so
     idx[:4] is correct and the midside nodes are simply not used for contouring.
+
+    `cells` is the same elements as NODE INDICES, (nelem, 4). polys is the
+    undeformed shape and is what the overlay draws by default; the indices are
+    what lets the deformed shape be rebuilt, since displacing an element means
+    moving its nodes and coordinates alone have forgotten which nodes those
+    were.
+
+    `polys` is the ORIGINAL cell outline, (nelem, 4, 2), kept alongside the
+    triangulation so the mesh overlay can draw real elements rather than the
+    triangulation's edges. Those are not the same picture: splitting a quad
+    adds a diagonal that is not in the mesh, and a wireframe full of invented
+    diagonals is exactly the thing you must not show someone who is checking
+    their discretisation. Triangles are padded to four vertices by repeating
+    the last one, so the array stays rectangular -- the same trick
+    read_mesh_for_plot uses, and it draws as the triangle it is.
+
+    It comes from the VTK rather than from the .msh on purpose: this is the
+    geometry the phi values on screen were computed on, needs no mesh path to
+    be set, and cannot disagree with the field it is drawn over.
     """
     with open(path, "r", errors="replace") as fh:
         lines = fh.read().splitlines()
@@ -1350,34 +1648,77 @@ def read_vtk_geometry(path: str):
         raise ValueError("no CELLS block")
     nelem = int(lines[j].split()[1])
     tris = []
+    cells = []
     for ln in lines[j + 1:j + 1 + nelem]:
         v = ln.split()
         nn = int(v[0])
         idx = [int(t) for t in v[1:1 + nn]]
         if nn == 3:
             tris.append(idx)
+            cells.append([idx[0], idx[1], idx[2], idx[2]])
         elif nn in (4, 8):
             q = idx[:4]
             tris.append([q[0], q[1], q[2]])
             tris.append([q[0], q[2], q[3]])
+            cells.append(q)
     if not tris:
         raise ValueError("no supported cells")
-    return mtri.Triangulation(pts[:, 0], pts[:, 1], np.array(tris)), npoin
+    idx = np.asarray(cells, dtype=np.int64) if cells else None
+    polys = pts[idx, :2] if idx is not None else None
+    return (mtri.Triangulation(pts[:, 0], pts[:, 1], np.array(tris)),
+            npoin, polys, idx)
+
+
+def read_vtk_field(path: str, name: str, npoin: int, nelem: int):
+    """One named field out of a snapshot. Deliberately skips POINTS/CELLS.
+
+    Returns (values, where) with one value per NODE or per ELEMENT depending
+    on the field -- the caller has to know which, because a nodal field is
+    contoured and an element field is not.
+
+    The block names are unique across the file ("SCALARS phi" vs "SCALARS
+    sigma_xx"), so each is found by its own header and the point/cell split in
+    the file never has to be parsed.
+    """
+    spec = CRACK_FIELDS.get(name)
+    if spec is None:
+        raise ValueError(f"unknown field {name!r}")
+    with open(path, "r", errors="replace") as fh:
+        lines = fh.read().splitlines()
+    i = _header(lines, spec["block"])
+    if i < 0:
+        raise ValueError(f"no '{spec['block']}' block")
+
+    count = npoin if spec["where"] == "point" else nelem
+    if spec["block"].startswith("VECTORS"):
+        # No LOOKUP_TABLE after a VECTORS header, and three floats per node
+        # (writeVTK pads the z component with a literal 0).
+        vals = _floats(lines, i + 1, i + 1 + count)
+        if vals.size != 3 * count:
+            raise ValueError(f"{name} has {vals.size} values, "
+                             f"expected {3 * count}")
+        vec = vals.reshape(count, 3)[:, :2]
+        out = (np.hypot(vec[:, 0], vec[:, 1]) if spec["comp"] == "mag"
+               else vec[:, int(spec["comp"])])
+    else:
+        # LOOKUP_TABLE always follows SCALARS in what writeVTK emits.
+        out = _floats(lines, i + 2, i + 2 + count)
+        if out.size != count:
+            raise ValueError(f"{name} has {out.size} values, "
+                             f"expected {count}")
+    return out, spec["where"]
+
+
+def read_vtk_displacement(path: str, npoin: int):
+    """(npoin, 2) nodal displacement, for drawing the deformed shape."""
+    ux, _ = read_vtk_field(path, "ux", npoin, 0)
+    uy, _ = read_vtk_field(path, "uy", npoin, 0)
+    return np.column_stack([ux, uy])
 
 
 def read_vtk_phi(path: str, npoin: int):
-    """Just the phi field. Deliberately skips POINTS/CELLS parsing."""
-    with open(path, "r", errors="replace") as fh:
-        lines = fh.read().splitlines()
-    i = _header(lines, "SCALARS phi")
-    if i < 0:
-        raise ValueError("no 'SCALARS phi' block")
-    # LOOKUP_TABLE always follows SCALARS in what writeVTK emits.
-    start = i + 2
-    phi = _floats(lines, start, start + npoin)
-    if phi.size != npoin:
-        raise ValueError(f"phi has {phi.size} values, expected {npoin}")
-    return phi
+    """phi alone, kept as its own name because most callers only want that."""
+    return read_vtk_field(path, "phi", npoin, 0)[0]
 
 
 _CURVE_CACHE = {}
@@ -1387,6 +1728,26 @@ def reset_curve_cache(path: str) -> None:
     """Forget the incremental reader state before a new solve reuses a path."""
     if path:
         _CURVE_CACHE.pop(os.path.abspath(path), None)
+
+
+def _curve_snapshot(state):
+    """Hand back COPIES of the accumulating lists.
+
+    The incremental reader owns these lists and appends to them on every call.
+    Returning them directly means a caller that keeps `u` across two reads
+    finds it has silently grown -- the value it measured and the value it
+    plotted are no longer the same object's contents. Nothing in the GUI is
+    bitten by that today because every reader runs on the Tk thread, but it is
+    exactly the aliasing that turns into a real fault the moment one of them
+    moves to a worker.
+
+    The copy is not the cost that mattered: re-PARSING the whole CSV was
+    ~19 ms at 10.5k rows, and copying four built lists is a couple of hundred
+    microseconds. Keeping the parse incremental is what bought the speed;
+    handing out references bought nothing.
+    """
+    return (list(state["u"]), list(state["F"]), list(state["phi"]),
+            list(state["conv"]), state["labels"])
 
 
 def read_curve(path: str):
@@ -1418,8 +1779,7 @@ def read_curve(path: str):
         _CURVE_CACHE[key] = state
 
     if size == state["offset"]:
-        return (state["u"], state["F"], state["phi"], state["conv"],
-                state["labels"])
+        return _curve_snapshot(state)
 
     try:
         with open(path, "rb") as fh:
@@ -1427,8 +1787,7 @@ def read_curve(path: str):
             chunk = fh.read()
             state["offset"] = fh.tell()
     except OSError:
-        return (state["u"], state["F"], state["phi"], state["conv"],
-                state["labels"])
+        return _curve_snapshot(state)
 
     data = state["tail"] + chunk
     lines = data.splitlines(keepends=True)
@@ -1468,8 +1827,113 @@ def read_curve(path: str):
         state["F"].append(vF)
         state["phi"].append(vphi)
         state["conv"].append(vconv)
-    return (state["u"], state["F"], state["phi"], state["conv"],
-            state["labels"])
+    return _curve_snapshot(state)
+
+
+_STAGGER_CACHE = {}
+
+
+def reset_stagger_cache(path: str) -> None:
+    if path:
+        _STAGGER_CACHE.pop(os.path.abspath(path), None)
+
+
+def read_stagger(path: str):
+    """The per-sweep log, collapsed to one entry per LOAD STEP.
+
+    The file has a row per staggered sweep: load_factor, sweep, E_total,
+    E_elastic, E_fracture, R_norm. Eight thousand steps at ten sweeps each is
+    ~80,000 rows, so it is read incrementally by byte offset exactly like
+    read_curve -- re-parsing it twice a second during a solve is not an
+    option.
+
+    What comes back is per STEP, not per sweep, because that is the question:
+    a step is one increment of load, and what you want to know about it is how
+    many sweeps it needed and where it ended up. The sweep-by-sweep detail
+    inside a step matters far less than the fact that the step used all ten.
+
+    Returns lists: lf, sweeps, E_total, E_elastic, E_fracture, R_norm.
+    """
+    empty = {"lf": [], "sweeps": [], "E_total": [], "E_elastic": [],
+             "E_fracture": [], "R_norm": []}
+    if not path or not os.path.isfile(path):
+        return empty
+    key = os.path.abspath(path)
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return empty
+
+    st = _STAGGER_CACHE.get(key)
+    # A shrinking file means a new solve replaced it.
+    if st is None or size < st["offset"]:
+        st = {"offset": 0, "tail": b"", "cols": None, "cur": None,
+              "out": {k: [] for k in empty}}
+        _STAGGER_CACHE[key] = st
+    if size == st["offset"]:
+        return _stagger_snapshot(st)
+
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(st["offset"])
+            chunk = fh.read()
+            st["offset"] = fh.tell()
+    except OSError:
+        return _stagger_snapshot(st)
+
+    data = st["tail"] + chunk
+    lines = data.splitlines(keepends=True)
+    if lines and not lines[-1].endswith((b"\n", b"\r")):
+        st["tail"] = lines.pop()
+    else:
+        st["tail"] = b""
+
+    out = st["out"]
+    for raw in lines:
+        try:
+            row = next(csv.reader([raw.decode("utf-8", errors="replace")]))
+        except (csv.Error, StopIteration):
+            continue
+        if st["cols"] is None:
+            head = [h.strip() for h in row]
+            try:
+                st["cols"] = tuple(head.index(c) for c in
+                                   ("load_factor", "sweep", "E_total",
+                                    "E_elastic", "E_fracture", "R_norm"))
+            except ValueError:
+                st["cols"] = ()
+            continue
+        if not st["cols"]:
+            continue
+        ilf, isw, itot, iel, ifr, irn = st["cols"]
+        try:
+            lf = float(row[ilf]); sw = int(float(row[isw]))
+            tot = float(row[itot]); el = float(row[iel])
+            fr = float(row[ifr]); rn = float(row[irn])
+        except (ValueError, IndexError):
+            continue
+        cur = st["cur"]
+        if cur is not None and lf != cur[0]:
+            # A new load factor: the step that just ended is final. Appended
+            # only now, so a step is never reported half-swept.
+            for k, v in zip(("lf", "sweeps", "E_total", "E_elastic",
+                             "E_fracture", "R_norm"), cur):
+                out[k].append(v)
+            cur = None
+        st["cur"] = [lf, sw, tot, el, fr, rn] if cur is None else \
+            [lf, max(cur[1], sw), tot, el, fr, rn]
+    return _stagger_snapshot(st)
+
+
+def _stagger_snapshot(st):
+    """Copies, plus the step still being swept so a live run is not a step
+    behind. See _curve_snapshot for why these are copies."""
+    out = {k: list(v) for k, v in st["out"].items()}
+    if st["cur"] is not None:
+        for k, v in zip(("lf", "sweeps", "E_total", "E_elastic",
+                         "E_fracture", "R_norm"), st["cur"]):
+            out[k].append(v)
+    return out
 
 
 _MESH_CACHE = {}          # path -> (mtime, data)
@@ -2049,6 +2513,72 @@ class SpecTable(ttk.Frame):
                 self.add_row(row)
 
 
+class FlowBar(ttk.Frame):
+    """A row of controls that WRAPS onto more rows instead of being clipped.
+
+    Tk has no flow layout. pack() puts everything on one line and silently
+    cuts off whatever does not fit, which is how a toolbar loses its
+    right-hand end the moment the window is not maximised -- and the
+    right-hand end is where the read-outs are. Splitting a bar into two fixed
+    rows by hand only moves the width at which it happens.
+
+    So: measure what each control asks for, and lay them out into as many rows
+    as it takes. Children are created with the FlowBar as their parent and are
+    then packed INTO row frames, which Tk allows because the rows are its
+    descendants.
+    """
+
+    def __init__(self, parent, gap=6, **kw):
+        super().__init__(parent, **kw)
+        self._items = []
+        self._gap = gap
+        self._rows = []
+        self._width = -1
+        self.bind("<Configure>", self._reflow)
+
+    def add(self, widget, padx=0):
+        self._items.append((widget, padx))
+        return widget
+
+    def _row(self, i):
+        while len(self._rows) <= i:
+            self._rows.append(ttk.Frame(self))
+        return self._rows[i]
+
+    def _reflow(self, event=None):
+        width = event.width if event is not None else self.winfo_width()
+        # Re-packing changes this frame's HEIGHT, which fires <Configure>
+        # again with the same width. Without this guard that is an infinite
+        # loop, not a slow redraw.
+        if width <= 1 or abs(width - self._width) < 2:
+            return
+        self._width = width
+        for row in self._rows:
+            row.pack_forget()
+        last, used = 0, 0
+        for widget, padx in self._items:
+            # padx is Tk's, so it is either a number or a (left, right) pair.
+            pad = (sum(padx) if isinstance(padx, (tuple, list)) else 2 * padx)
+            need = widget.winfo_reqwidth() + pad + self._gap
+            if used and used + need > width:
+                last += 1
+                used = 0
+            row = self._row(last)
+            widget.pack(in_=row, side="left", padx=padx)
+            # AND RAISE IT. Packing a widget `in_` something that is not its
+            # parent only decides where it is POSITIONED; the stacking order
+            # is untouched, and these rows are siblings of the controls that
+            # were created before them. So the row's own background was drawn
+            # on top and the entire bar came out as an empty strip -- present,
+            # correctly sized, invisible. Nothing that inspects geometry can
+            # see that, which is why it survived a test suite.
+            widget.lift(row)
+            used += need
+        for i, row in enumerate(self._rows):
+            if i <= last:
+                row.pack(fill="x")
+
+
 class ScrollFrame(ttk.Frame):
     """A frame scrollable in both directions.
 
@@ -2078,9 +2608,6 @@ class ScrollFrame(ttk.Frame):
         self.grid_columnconfigure(0, weight=1)
 
         self._req_w, self._req_at = width, 0.0
-        self._live_resize = False
-        self._pending_canvas_w = width
-        self._applied_inner_w = 0
         self.inner = ttk.Frame(self.canvas)
         self._win = self.canvas.create_window((0, 0), window=self.inner,
                                               anchor="nw")
@@ -2108,29 +2635,11 @@ class ScrollFrame(ttk.Frame):
         # cannot change while dragging (the contents are not changing), so
         # cache it briefly. The TTL keeps it correct when the panel really is
         # rebuilt -- e.g. switching geometry source swaps the whole form.
-        self._pending_canvas_w = event.width
-        # During a sash drag, resizing this embedded window reflows every
-        # section, table and validation label in the long form.  The canvas
-        # itself already follows the pointer, so defer only the expensive
-        # content reflow until release.
-        if self._live_resize:
-            return
-        self._apply_canvas_width()
-
-    def _apply_canvas_width(self):
         now = time.time()
         if now - getattr(self, "_req_at", 0.0) > 0.15:
             self._req_w, self._req_at = self.inner.winfo_reqwidth(), now
-        target = max(self._pending_canvas_w, self._req_w)
-        if target == self._applied_inner_w:
-            return
-        self._applied_inner_w = target
-        self.canvas.itemconfig(self._win, width=target)
-
-    def set_live_resize(self, active):
-        self._live_resize = bool(active)
-        if not active:
-            self._apply_canvas_width()
+        self.canvas.itemconfig(self._win,
+                               width=max(event.width, self._req_w))
 
     def _wheel(self, event):
         self.canvas.yview_scroll(int(-event.delta / 120), "units")
@@ -2301,7 +2810,24 @@ class App:
         self.proc_kind = ""          # "solve" | "check" | "mesh"
         self._on_success = None
         self.log_q: queue.Queue = queue.Queue()
+        # Results from the background file readers come back here as
+        # (callback, args) and are applied on the Tk thread by _tick. Tk and
+        # matplotlib are touched from nowhere else.
         self.io_q: queue.Queue = queue.Queue()
+        self._closing = False
+        # gmsh keeps global state, so exactly one reader may be inside it at a
+        # time -- a lock, not a thread pool.
+        self._io_lock = threading.Lock()
+        # Monotonic per-kind request ids. A read that has been superseded is
+        # DISCARDED on arrival rather than cancelled: gmsh cannot be
+        # interrupted part-way through an open(), so the only safe thing is to
+        # let it finish and ignore what it produced.
+        self._mesh_request = 0
+        self._group_request = 0
+        self._crack_request = 0
+        self._crack_loading_path = ""
+        self._crack_snaps: list = []    # (step, path) for the current run
+        self._notch_tried: set = set()  # (mesh path, mtime) already read
         self.start_time = 0.0
         self.csv_path = ""
         self.last_rows = -1
@@ -2315,37 +2841,25 @@ class App:
         # Progress / ETA state
         self._plan_total = 0        # planned steps for the running job
         self._step_times: list = []  # recent per-step wall times, seconds
-        self._stage_times: list[list[float]] = [[], [], []]
+        # Per-STAGE step times. A coarse step and a step during crack growth
+        # cost very different amounts, so one pooled rate predicts neither.
+        self._stage_times: list = [[], [], []]
         self._last_stage_rates = [0.0, 0.0, 0.0]
-        self._run_form = None       # schedule used by the currently running job
+        self._run_form = None       # the schedule the running job was given
         self._last_step = 0
         self._last_rate = 0.0       # s/step carried over from the previous run
         self._peak_reported = False
+        self._last_elapsed = -1     # whole seconds already shown on the clock
+        self._curve_drawn = False   # has the curve been drawn at least once
         self._laid_out: dict = {}   # id(figure) -> layout key, see _layout()
         self._dragging = False      # a pane sash is being dragged
-        self._dragging_pane = None
         self._resize_pending: set = set()
         self._rows: dict = {}           # key -> [widgets], for show/hide
-        self._sections: dict = {}       # title -> collapsible section state
-        self._field_widgets: dict = {}  # config key -> entry/combobox
-        self._field_feedback: dict = {} # config key -> (label, normal text)
-        self._field_sections: dict = {} # config key -> owning section title
-        self._validation_job = None
         self._charw = 0                 # width of "0" in the form font
-        self._closing = False
-        self._io_lock = threading.Lock()  # gmsh and large VTK reads, one at a time
-        self._mesh_request = 0
-        self._group_request = 0
-        self._crack_request = 0
-        self._crack_loading_path = ""
-        self._curve_artists = None
-        self._curve_annotations = []
-        self._log_history = []
-        self._log_history_chars = 0
-        self.gui_state = self._load_gui_state()
+        self._sections: dict = {}       # title -> its widgets and open state
+        self._field_section: dict = {}  # field key -> the section holding it
 
         self._build()
-        self._bind_shortcuts()
         self.set_form(dict(DEFAULTS))
         if initial_config:
             self.import_config(os.path.join(PROJECT_DIR, initial_config))
@@ -2361,17 +2875,14 @@ class App:
         # Classic tk.PanedWindow rather than ttk's, because it can be styled
         # (background = the sash colour) and takes minsize/stretch per pane.
         #
-        # The horizontal split uses a preview sash: this panel can contain
-        # hundreds of native controls and Windows repaints all of them when its
-        # viewport changes.  Committing that once on release is much smoother.
-        # The vertical split remains live because plots/log are cheap once the
-        # matplotlib resize guard below defers figure rendering.
+        # opaqueresize=True: the panes follow the mouse. What made that stutter
+        # before is NOT the pane geometry -- it is that every <Configure> makes
+        # FigureCanvasTkAgg re-render the whole figure (80 ms on the Mesh tab).
+        # _install_resize_guard below intercepts that event and defers the
+        # render until the sash is released, so the panes track the pointer at
+        # full rate and the plot re-renders exactly once.
         outer = tk.PanedWindow(self.root, orient="horizontal",
-                               # Repainting the long settings form at every
-                               # mouse pixel remains expensive even when its
-                               # geometry is frozen.  A preview sash moves at
-                               # pointer speed and commits the layout once.
-                               opaqueresize=False, background=T["grid"],
+                               opaqueresize=True, background=T["grid"],
                                borderwidth=0, sashwidth=px(6), sashpad=0,
                                sashrelief="flat")
         outer.pack(fill="both", expand=True)
@@ -2388,19 +2899,31 @@ class App:
         outer.add(left, minsize=px(420), stretch="always")
         self.paned = outer
 
-        # Compact gui2-style results header.  Keep each line to one purpose:
-        # solver, actions, state/time, progress, then the live numerical readout.
+        # --- top bar ---
         bar = ttk.Frame(left, padding=px(8))
         bar.pack(fill="x")
         ttk.Label(bar, text="Solver").pack(side="left")
+        # The BUTTON is packed first, against the right, and the entry takes
+        # whatever is left. Packed the other way round a 48-character entry
+        # claims its full width and pushes the browse button off the edge --
+        # and an entry you can scroll is a far smaller loss than a button you
+        # cannot reach.
+        ttk.Button(bar, text="...", width=3,
+                   command=self._pick_exe).pack(side="right", padx=(px(4), 0))
         self.exe_var = tk.StringVar(value=find_exe())
-        ttk.Entry(bar, textvariable=self.exe_var, width=48).pack(
-            side="left", padx=4)
-        ttk.Button(bar, text="...", width=3, command=self._pick_exe).pack(side="left")
+        ttk.Entry(bar, textvariable=self.exe_var).pack(
+            side="left", padx=px(4), fill="x", expand=True)
 
         bar2 = ttk.Frame(left, padding=(px(8), 0))
         bar2.pack(fill="x")
-        self.btn_check = ttk.Button(bar2, text="Check mesh", command=self.check_mesh)
+        # Left to right in the order you use them -- check, then run, then
+        # stop -- with the weight on Run rather than on its position.
+        # Also first, for the same reason: packed last it was the control
+        # that vanished when the results column got narrow.
+        ttk.Button(bar2, text="Output folder",
+                   command=self._open_output).pack(side="right")
+        self.btn_check = ttk.Button(bar2, text="Check mesh",
+                                    command=self.check_mesh)
         self.btn_check.pack(side="left")
         self.btn_run = ttk.Button(bar2, text="Run", command=self.run,
                                   style="Primary.TButton")
@@ -2408,38 +2931,49 @@ class App:
         self.btn_stop = ttk.Button(bar2, text="Stop", command=self.stop,
                                    state="disabled", style="Danger.TButton")
         self.btn_stop.pack(side="left")
-        ttk.Button(bar2, text="Output folder",
-                   command=self._open_output).pack(side="right")
 
+        # ONE status area, and every slot in it has exactly one writer:
+        #
+        #   state     what the program is doing      lifecycle, colour-coded
+        #   elapsed   how long it has been doing it  the clock
+        #   progress  how far through                bar + step / rate / ETA
+        #   readout   what the solve currently says  the physics numbers
+        #
+        # They were two labels before, and _refresh_plot rewrote one of them
+        # twice a second with the live numbers -- the same label that carried
+        # "FAILED (exit 3221225781)". So the one message you most needed to
+        # read survived until the next plot refresh, and the two writers had
+        # to be kept apart by a comment rather than by structure.
         sbar = ttk.Frame(left, padding=(px(8), px(6), px(8), 0))
         sbar.pack(fill="x")
         sbar.grid_columnconfigure(0, weight=1)
 
-        self.status = tk.StringVar(value="idle")
-        self.state = self.status
-        self.state_lbl = ttk.Label(sbar, textvariable=self.status, anchor="w",
-                                   font=("TkDefaultFont", 10, "bold"),
-                                   foreground=T["muted"])
+        self.state = tk.StringVar(value="idle")
+        self.state_lbl = ttk.Label(sbar, textvariable=self.state, anchor="w",
+                                   font=("TkDefaultFont", 10, "bold"))
         self.state_lbl.grid(row=0, column=0, sticky="w")
-        self.elapsed_txt = tk.StringVar(value="")
-        self.elapsed = self.elapsed_txt
-        ttk.Label(sbar, textvariable=self.elapsed_txt, foreground=T["muted"],
+        self.elapsed = tk.StringVar(value="")
+        ttk.Label(sbar, textvariable=self.elapsed, foreground=T["muted"],
                   anchor="e").grid(row=0, column=1, sticky="e")
 
         self.progress = ttk.Progressbar(sbar, mode="determinate", maximum=1000)
         self.progress.grid(row=1, column=0, columnspan=2, sticky="ew",
                            pady=(px(5), 0))
         self.progress_txt = tk.StringVar(value="")
-        ttk.Label(sbar, textvariable=self.progress_txt, anchor="w",
-                  foreground=T["muted"]).grid(
-                      row=2, column=0, columnspan=2, sticky="ew",
-                      pady=(px(2), 0))
-        self.curve_status = tk.StringVar(value="")
-        self.readout = self.curve_status
-        ttk.Label(sbar, textvariable=self.curve_status, foreground=T["fg"],
-                  font=("Consolas", 9), anchor="w").grid(
-                      row=3, column=0, columnspan=2, sticky="ew",
-                      pady=(px(2), 0))
+        self._wrapping(ttk.Label(sbar, textvariable=self.progress_txt,
+                                 foreground=T["muted"], anchor="w",
+                                 justify="left"),
+                       sbar).grid(row=2, column=0, columnspan=2, sticky="ew",
+                                  pady=(px(2), 0))
+        # Monospaced: these are numbers that change in place every half
+        # second, and in a proportional face the whole line jitters sideways
+        # every time a digit changes width.
+        self.readout = tk.StringVar(value="")
+        self._wrapping(ttk.Label(sbar, textvariable=self.readout,
+                                 foreground=T["fg"], font=("Consolas", 9),
+                                 anchor="w", justify="left"),
+                       sbar).grid(row=3, column=0, columnspan=2, sticky="ew",
+                                  pady=(px(2), 0))
 
         # Second splitter: plots above, log below.
         vpane = tk.PanedWindow(left, orient="vertical", opaqueresize=True,
@@ -2449,24 +2983,35 @@ class App:
         self.vpaned = vpane
 
         nb = ttk.Notebook(vpane)
+        # The floor has to fit the tab strip, the tab's own control bar and
+        # the matplotlib toolbar, with something left for the plot. At 180 it
+        # was about equal to that chrome, which leaves the packer deciding
+        # what to drop when the sash is dragged to the bottom -- and what it
+        # drops is whatever was packed last.
         vpane.add(nb, minsize=px(230), stretch="always")
         self.nb = nb
 
         curve_tab = ttk.Frame(nb)
         nb.add(curve_tab, text="Force - displacement")
         self.curve_tab = curve_tab
-        fbar = ttk.Frame(curve_tab, padding=(0, px(4)))
+        # Same idiom as the Mesh and Crack tabs: a Fit button and a follow
+        # toggle. Those two tabs already preserved a view you had set up; this
+        # one threw it away on the next refresh, twice a second.
+        fbar = FlowBar(curve_tab, padding=(0, px(4)))
         fbar.pack(fill="x")
-        ttk.Button(fbar, text="Fit", width=5, style="Tool.TButton",
-                   command=self.fit_curve).pack(side="left")
+        fbar.add(ttk.Button(fbar, text="Fit", width=5, command=self.fit_curve))
         self.follow_curve = tk.BooleanVar(value=True)
-        ttk.Checkbutton(fbar, text="follow the data",
-                        variable=self.follow_curve,
-                        command=self._follow_curve_changed).pack(
-                            side="left", padx=px(8))
+        fbar.add(ttk.Checkbutton(fbar, text="follow the data",
+                                 variable=self.follow_curve,
+                                 command=self._follow_curve_changed),
+                 padx=px(8))
         self.curve_hint = tk.StringVar(value="")
-        ttk.Label(fbar, textvariable=self.curve_hint,
-                  foreground=T["muted"]).pack(side="left", padx=px(4))
+        chint = ttk.Frame(curve_tab)
+        chint.pack(fill="x")
+        self._wrapping(ttk.Label(chint, textvariable=self.curve_hint,
+                                 foreground=T["muted"], anchor="w",
+                                 justify="left"), chint).pack(fill="x",
+                                                              padx=px(2))
         self.fig = Figure(figsize=(7, 3.4), dpi=100)
         self.ax = self.fig.add_subplot(111)
         self.ax.set_xlabel("applied displacement")
@@ -2474,12 +3019,18 @@ class App:
         style_axes(self.fig, self.ax)
         self.fig.tight_layout()
         self.canvas = FigureCanvasTkAgg(self.fig, master=curve_tab)
-        # Reserve the fixed toolbar first.  Packing the expanding canvas first
-        # lets it claim the whole parcel after a sash move, leaving a toolbar
-        # that exists but is not mapped.
+        # Toolbar FIRST, against the bottom. Tk's packer hands out space in
+        # packing order, so a canvas packed first with expand=True claims the
+        # lot and anything packed after it is left with nothing -- which is
+        # why the toolbar vanished as soon as the sash made the plot pane
+        # short. Reserving its height first and letting the canvas expand into
+        # the remainder is the fix, and it costs nothing when there is room.
         self.curve_toolbar = add_toolbar(self.canvas, curve_tab)
         self.curve_toolbar.pack(side="bottom", fill="x")
         self.canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+        # Reaching for the toolbar's zoom or pan IS the instruction to stop
+        # following. Asking for it twice -- zoom, then also remember to untick
+        # a box -- would just be the same bug with an extra step.
         self.canvas.mpl_connect("button_release_event", self._curve_interacted)
 
         mesh_tab = ttk.Frame(nb)
@@ -2489,33 +3040,40 @@ class App:
         # while the curve is showing only set a flag; the redraw happens when
         # you switch to the Mesh tab.
         nb.bind("<<NotebookTabChanged>>", self._tab_changed)
-        mbar = ttk.Frame(mesh_tab, padding=(0, px(4)))
+        mbar = FlowBar(mesh_tab, padding=(0, px(4)))
         mbar.pack(fill="x")
-        ttk.Button(mbar, text="Draw mesh", command=self.draw_mesh,
-                   style="Tool.TButton").pack(side="left")
-        ttk.Button(mbar, text="Fit", width=5, style="Tool.TButton",
-                   command=self.fit_mesh).pack(side="left", padx=4)
+        mbar.add(ttk.Button(mbar, text="Draw mesh", command=self.draw_mesh))
+        mbar.add(ttk.Button(mbar, text="Fit", width=5, command=self.fit_mesh),
+                 padx=px(4))
         self.show_bc_only = tk.BooleanVar(value=True)
-        ttk.Checkbutton(mbar, text="highlight BC groups only",
-                        variable=self.show_bc_only,
-                        command=self.draw_mesh).pack(side="left", padx=8)
-        ttk.Label(mbar, text="view").pack(side="left", padx=(8, 2))
+        bcchk = mbar.add(ttk.Checkbutton(mbar, text="BC groups only",
+                                         variable=self.show_bc_only,
+                                         command=self.draw_mesh), padx=px(8))
+        Tip(bcchk, "Pick out only the physical groups a boundary condition "
+                   "refers to. Off, every named group in the mesh is drawn.")
+        mbar.add(ttk.Label(mbar, text="view"), padx=(px(8), px(2)))
         self.mesh_view = tk.StringVar(value=MESH_VIEWS[0])
-        mv = ttk.Combobox(mbar, textvariable=self.mesh_view, values=MESH_VIEWS,
-                          width=11, state="readonly")
-        mv.pack(side="left")
+        mv = mbar.add(ttk.Combobox(mbar, textvariable=self.mesh_view,
+                                   values=MESH_VIEWS, width=11,
+                                   state="readonly"))
         mv.bind("<<ComboboxSelected>>",
                 lambda _e: self.draw_mesh(preserve_view=True))
+        # Its own row. On one line with the controls it was the last thing
+        # packed, so it was the first thing clipped -- and it is the only part
+        # of that row carrying numbers.
         self.mesh_stats = tk.StringVar(value="")
-        ttk.Label(mbar, textvariable=self.mesh_stats,
-                  foreground=T["muted"]).pack(side="left", padx=8)
+        mstat = ttk.Frame(mesh_tab)
+        mstat.pack(fill="x")
+        self._wrapping(ttk.Label(mstat, textvariable=self.mesh_stats,
+                                 foreground=T["muted"], anchor="w",
+                                 justify="left"), mstat).pack(fill="x",
+                                                              padx=px(2))
         self.mfig = Figure(figsize=(7, 3.4), dpi=100)
         self.max_ = self.mfig.add_subplot(111)
         style_axes(self.mfig, self.max_)
         self.mfig.tight_layout()
         self.mcanvas = FigureCanvasTkAgg(self.mfig, master=mesh_tab)
-        self.mesh_toolbar = add_toolbar(self.mcanvas, mesh_tab)
-        self.mesh_toolbar.pack(side="bottom", fill="x")
+        add_toolbar(self.mcanvas, mesh_tab).pack(side="bottom", fill="x")
         self.mcanvas.get_tk_widget().pack(side="top", fill="both", expand=True)
         # Wheel-zoom about the cursor, which is what a mesh viewer should do.
         # The toolbar still offers rubber-band zoom and pan for fine control.
@@ -2526,158 +3084,201 @@ class App:
         crack_tab = ttk.Frame(nb)
         nb.add(crack_tab, text="Crack (phi)")
         self.crack_tab = crack_tab
-        self._crack_step = -1
-        self._crack_path = ""
-        self._crack_snapshots = []
-        cbar_ = ttk.Frame(crack_tab, padding=(0, px(4)))
+        cbar_ = FlowBar(crack_tab, padding=(0, px(4)))
         cbar_.pack(fill="x")
-
-        # Compact snapshot history.  The states are saved VTK files rather
-        # than every solver step, because vtk_every intentionally leaves gaps.
-        nav = ttk.Frame(cbar_)
-        self.crack_nav = nav
-        ttk.Label(nav, text="State", font=("TkDefaultFont", 9, "bold")).pack(
-            side="left", padx=(px(4), px(6)))
-        self.btn_crack_first = ttk.Button(
-            nav, text="First", width=5, style="Tool.TButton",
-            command=self._show_first_crack, state="disabled")
-        self.btn_crack_first.pack(side="left")
-        Tip(self.btn_crack_first, "Show the first saved phase-field state.")
-        self.btn_crack_prev = ttk.Button(
-            nav, text="<", width=3, style="Tool.TButton",
-            command=lambda: self._move_crack_state(-1), state="disabled")
-        self.btn_crack_prev.pack(side="left", padx=(px(4), 0))
-        Tip(self.btn_crack_prev, "Show the previous saved phase-field state.")
-        self.crack_state_text = tk.StringVar(value="no states")
-        state_label = ttk.Label(nav, textvariable=self.crack_state_text, width=14,
-                                anchor="center", foreground=T["muted"])
-        state_label.pack(side="left", padx=px(5))
-        Tip(state_label, "Saved-state position and the corresponding solver step number.")
-        self.btn_crack_next = ttk.Button(
-            nav, text=">", width=3, style="Tool.TButton",
-            command=lambda: self._move_crack_state(1), state="disabled")
-        self.btn_crack_next.pack(side="left")
-        Tip(self.btn_crack_next, "Show the next saved phase-field state.")
-        self.btn_crack_latest = ttk.Button(
-            nav, text="Latest", width=6, style="Tool.TButton",
-            command=self._show_latest_crack, state="disabled")
-        self.btn_crack_latest.pack(side="left", padx=(px(4), px(4)))
-        Tip(self.btn_crack_latest,
-            "Jump to the newest state and resume following the running solver.")
-
-        options = ttk.Frame(cbar_)
-        self.crack_options = options
-        ttk.Button(options, text="Refresh", command=self.draw_crack,
-                   style="Tool.TButton").pack(side="left")
-        ttk.Button(options, text="Fit", width=5, style="Tool.TButton",
-                   command=self.fit_crack).pack(side="left", padx=4)
+        # Step through the snapshots. The solver writes one every vtk_every
+        # accepted steps, so the folder is already a filmstrip of the crack --
+        # there was just no way to look at any frame but the last.
+        #
+        # "|<" and ">|" rather than arrow glyphs: this bar has to render in
+        # whatever UI font the machine has, and a missing glyph draws as a box
+        # on the two buttons you reach for most.
+        nav = cbar_.add(ttk.Frame(cbar_))
+        for text, cmd, tip in (
+                ("|<", self.crack_first, "First snapshot."),
+                ("<", self.crack_prev, "Previous snapshot. Stops following "
+                                       "the live run."),
+                (">", self.crack_next, "Next snapshot."),
+                (">|", self.crack_last, "Latest snapshot, and follow the run "
+                                        "again from here.")):
+            b = ttk.Button(nav, text=text, width=3, command=cmd)
+            b.pack(side="left", padx=1)
+            Tip(b, tip)
+        self.crack_pos = tk.StringVar(value="")
+        cbar_.add(ttk.Label(cbar_, textvariable=self.crack_pos,
+                            foreground=T["muted"], width=11, anchor="w"),
+                  padx=px(6))
+        cbar_.add(ttk.Button(cbar_, text="Refresh", command=self.draw_crack))
+        cbar_.add(ttk.Button(cbar_, text="Fit", width=5,
+                             command=self.fit_crack), padx=px(4))
         self.follow_crack = tk.BooleanVar(value=True)
-        ttk.Checkbutton(options, text="follow latest",
-                        variable=self.follow_crack,
-                        command=self._follow_crack_changed).pack(side="left", padx=8)
+        fchk = cbar_.add(ttk.Checkbutton(cbar_, text="follow",
+                                         variable=self.follow_crack),
+                         padx=px(8))
+        Tip(fchk, "Jump to each new snapshot as the solver writes it. Turned "
+                  "off automatically when you step back through the frames.")
         self.show_notch = tk.BooleanVar(value=True)
-        ttk.Checkbutton(options, text="notch", variable=self.show_notch,
-                        command=lambda: self.draw_crack(force=True)).pack(side="left")
+        cbar_.add(ttk.Checkbutton(cbar_, text="notch",
+                                  variable=self.show_notch,
+                                  command=self._redraw_crack_overlay))
 
-        display = ttk.Frame(cbar_)
-        self.crack_display = display
-        ttk.Label(display, text="crack iso").pack(side="left", padx=(px(4), 2))
+        # Everything below is on the SAME bar -- FlowBar decides how many rows
+        # that needs at the width it actually has. All of it on one line comes
+        # to roughly 1200 px, which no results column here is ever going to
+        # be, but a hand-split into two fixed rows only moves the width at
+        # which the end gets cut off.
+        cbar2 = cbar_
+        cbar2.add(ttk.Label(cbar2, text="field"), padx=(px(8), px(2)))
+        self.field_var = tk.StringVar(value="phi")
+        fld = cbar2.add(ttk.Combobox(cbar2, textvariable=self.field_var,
+                                     values=list(CRACK_FIELDS), width=10,
+                                     state="readonly"))
+        Tip(fld, "Which quantity to colour. phi and the displacements live on "
+                 "NODES and are contoured; the stresses are one value per "
+                 "ELEMENT and are drawn flat, because that is how the solver "
+                 "integrates them.")
+        fld.bind("<<ComboboxSelected>>", lambda _e: self._field_changed())
+        cbar2.add(ttk.Label(cbar2, text="crack iso"), padx=(px(8), px(2)))
         self.iso_var = tk.StringVar(value="0.9")
-        iso_entry = ttk.Entry(display, textvariable=self.iso_var, width=5)
-        iso_entry.pack(side="left")
-        iso_entry.bind("<Return>", lambda _e: self.draw_crack(force=True))
-        ttk.Label(display, text="colours").pack(side="left", padx=(8, 2))
+        self.iso_entry = cbar2.add(ttk.Entry(cbar2, textvariable=self.iso_var,
+                                             width=5))
+        cbar2.add(ttk.Label(cbar2, text="shape"), padx=(px(8), px(2)))
+        self.deform_var = tk.StringVar(value=CRACK_SHAPES[0])
+        dfm = cbar2.add(ttk.Combobox(cbar2, textvariable=self.deform_var,
+                                     values=CRACK_SHAPES, width=11,
+                                     state="readonly"))
+        Tip(dfm, "Draw the specimen at x + scale*u instead of at its "
+                 "reference position, so you see the crack physically open "
+                 "rather than only a field that says it did. 'auto' picks a "
+                 "magnification that makes the largest displacement about 6% "
+                 "of the specimen -- visible without being a cartoon.")
+        dfm.bind("<<ComboboxSelected>>", lambda _e: self._deform_changed())
+        cbar2.add(ttk.Label(cbar2, text="mesh"), padx=(px(8), px(2)))
+        self.crack_overlay = tk.StringVar(value=CRACK_OVERLAYS[0])
+        ov = cbar2.add(ttk.Combobox(cbar2, textvariable=self.crack_overlay,
+                                    values=CRACK_OVERLAYS, width=14,
+                                    state="readonly"))
+        Tip(ov, "Draw the mesh over the phi field. The question this answers "
+                "is whether l0 is resolved WHERE THE CRACK IS -- so zoom into "
+                "the tip first; the overlay is culled to what is on screen "
+                "and switches itself off when the elements would be "
+                "sub-pixel.")
+        # Redrawn from the phi already in hand -- no file is re-read, so this
+        # is instant even on a mesh whose first load took seconds.
+        ov.bind("<<ComboboxSelected>>", lambda _e: self._redraw_crack_overlay())
+        cbar2.add(ttk.Label(cbar2, text="colours"), padx=(px(8), px(2)))
         self.cmap_var = tk.StringVar(value="inferno")
-        cmb = ttk.Combobox(display, textvariable=self.cmap_var, values=CMAPS,
-                           width=10, state="readonly")
-        cmb.pack(side="left")
-        cmb.bind("<<ComboboxSelected>>", lambda _e: self.draw_crack(force=True))
+        # Two remembered choices, one combo. A sequential map is right for phi
+        # and a diverging one for a signed stress, so switching field swaps the
+        # list -- and swapping back has to return the map you had, not a
+        # default.
+        self._cmap_seq, self._cmap_div = "inferno", "coolwarm"
+        self.cmap_combo = cbar2.add(
+            ttk.Combobox(cbar2, textvariable=self.cmap_var, values=CMAPS,
+                         width=10, state="readonly"))
+        self.cmap_combo.bind("<<ComboboxSelected>>",
+                             lambda _e: self._cmap_changed())
+        # And the stats on a row of their own, reflowing. This line now
+        # carries the field range, the deformation scale and the overlay
+        # counts, so it is both the longest string in the window and the one
+        # you are actually reading.
         self.crack_stats = tk.StringVar(value="no snapshots yet")
-        ttk.Label(display, textvariable=self.crack_stats, anchor="w",
-                  foreground=T["muted"]).pack(side="left", fill="x", expand=True,
-                                                padx=(px(8), px(4)))
-        self._crack_controls_mode = ""
-        cbar_.bind("<Configure>", self._layout_crack_controls, add="+")
-        # Give the frames an initial manager before the first Configure event.
-        self._layout_crack_controls(width=max(1, self.win_w - px(520)))
+        cstat = ttk.Frame(crack_tab)
+        cstat.pack(fill="x")
+        self._wrapping(ttk.Label(cstat, textvariable=self.crack_stats,
+                                 foreground=T["muted"], anchor="w",
+                                 justify="left"), cstat).pack(fill="x",
+                                                              padx=px(2))
 
         self.cfig = Figure(figsize=(7, 3.4), dpi=100)
         self.cax = self.cfig.add_subplot(111)
         style_axes(self.cfig, self.cax)
         self.cfig.tight_layout()
         self.ccanvas = FigureCanvasTkAgg(self.cfig, master=crack_tab)
-        self.crack_toolbar = add_toolbar(self.ccanvas, crack_tab)
-        self.crack_toolbar.pack(side="bottom", fill="x")
+        add_toolbar(self.ccanvas, crack_tab).pack(side="bottom", fill="x")
         self.ccanvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+        # Arrow keys, bound to the CANVAS rather than the window: Left and
+        # Right belong to whatever Entry has focus everywhere else in this
+        # GUI, and stealing them globally would break typing in the form.
+        # matplotlib gives the canvas focus when it is clicked.
+        _cw = self.ccanvas.get_tk_widget()
+        _cw.bind("<Left>", lambda _e: self.crack_prev())
+        _cw.bind("<Right>", lambda _e: self.crack_next())
+        _cw.bind("<Home>", lambda _e: self.crack_first())
+        _cw.bind("<End>", lambda _e: self.crack_last())
         self._cbar = None          # colourbar, created once (levels are fixed)
         self._tri = None           # cached Triangulation
         self._tri_npoin = 0
+        self._tri_polys = None     # real cell outlines, for the mesh overlay
+        self._tri_cells = None     # the same elements as node indices
+        self._crack_last = None    # the frame on screen, for a cheap re-render
+        self._crack_step = -1
         self._vtk_sizes: dict = {}
+
+        # ---- Energy / convergence: the per-sweep log nothing ever read ----
+        energy_tab = ttk.Frame(nb)
+        nb.add(energy_tab, text="Energy")
+        self.energy_tab = energy_tab
+        ebar = FlowBar(energy_tab, padding=(0, px(4)))
+        ebar.pack(fill="x")
+        ebar.add(ttk.Button(ebar, text="Refresh",
+                            command=lambda: self.draw_energy(force=True)))
+        ebar.add(ttk.Label(ebar, text="show"), padx=(px(8), px(2)))
+        self.energy_view = tk.StringVar(value=ENERGY_VIEWS[0])
+        ev = ebar.add(ttk.Combobox(ebar, textvariable=self.energy_view,
+                                   values=ENERGY_VIEWS, width=12,
+                                   state="readonly"))
+        Tip(ev, "How to arrange the panels. Stacked shares one x-axis, so a "
+                "vertical line reads across all three at the same "
+                "displacement -- that is what makes the sweeps and the "
+                "residual worth reading together. Pick a single panel to give "
+                "it the whole pane.")
+        ev.bind("<<ComboboxSelected>>", lambda _e: self.draw_energy(force=True))
+        self.energy_logr = tk.BooleanVar(value=True)
+        ebar.add(ttk.Checkbutton(ebar, text="log residual",
+                                 variable=self.energy_logr,
+                                 command=lambda: self.draw_energy(force=True)),
+                 padx=px(8))
+        self.energy_stats = tk.StringVar(value="no energy log yet")
+        estat = ttk.Frame(energy_tab)
+        estat.pack(fill="x")
+        self._wrapping(ttk.Label(estat, textvariable=self.energy_stats,
+                                 foreground=T["muted"], anchor="w",
+                                 justify="left"), estat).pack(fill="x",
+                                                              padx=px(2))
+        self.efig = Figure(figsize=(7, 5.0), dpi=100)
+        self.eax = []
+        self._energy_built = None
+        self._energy_axes(ENERGY_VIEWS[0])
+        self.efig.tight_layout()
+        self.ecanvas = FigureCanvasTkAgg(self.efig, master=energy_tab)
+        add_toolbar(self.ecanvas, energy_tab).pack(side="bottom", fill="x")
+        self.ecanvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+        self._energy_rows = -1
 
         # stretch="never" so growing the window grows the PLOT and leaves the
         # log at whatever height you dragged it to.
         lf = ttk.Frame(vpane, padding=(0, px(6), 0, 0))
         vpane.add(lf, height=px(210), minsize=px(60), stretch="never")
-
-        logbar = ttk.Frame(lf)
-        logbar.pack(fill="x", pady=(0, px(4)))
-        ttk.Label(logbar, text="Log", font=("TkDefaultFont", 9, "bold")).pack(
-            side="left", padx=(0, px(6)))
-        self.log_search_var = tk.StringVar()
-        search = ttk.Entry(logbar, textvariable=self.log_search_var, width=18)
-        search.pack(side="left")
-        search.bind("<Return>", lambda _e: self._find_log(1))
-        search.bind("<Shift-Return>", lambda _e: self._find_log(-1))
-        ttk.Button(logbar, text="Prev", width=5,
-                   command=lambda: self._find_log(-1)).pack(side="left", padx=(px(3), 0))
-        ttk.Button(logbar, text="Next", width=5,
-                   command=lambda: self._find_log(1)).pack(side="left", padx=(px(3), px(7)))
-
-        self.log_filter_var = tk.StringVar(value="All output")
-        log_filter = ttk.Combobox(
-            logbar, textvariable=self.log_filter_var,
-            values=["All output", "Normal", "Warnings", "Convergence", "Errors"],
-            width=12, state="readonly")
-        log_filter.pack(side="left")
-        log_filter.bind("<<ComboboxSelected>>", lambda _e: self._apply_log_filter())
-
-        logactions = ttk.Frame(lf)
-        logactions.pack(fill="x", pady=(0, px(4)))
-        self.follow_log = tk.BooleanVar(value=True)
-        ttk.Checkbutton(logactions, text="Follow tail", variable=self.follow_log,
-                        command=self._follow_log_changed).pack(
-            side="left")
-        ttk.Button(logactions, text="Copy", width=5,
-                   command=self._copy_log).pack(side="left", padx=(px(7), 0))
-        ttk.Button(logactions, text="Clear", width=5, command=self._clear_log).pack(
-            side="left", padx=px(3))
-        ttk.Button(logactions, text="Save", width=5,
-                   command=self._save_log).pack(side="left")
-
-        logbody = ttk.Frame(lf)
-        logbody.pack(fill="both", expand=True)
-        self.log = tk.Text(logbody, height=6, wrap="none", font=("Consolas", 9),
+        self.log = tk.Text(lf, height=6, wrap="none", font=("Consolas", 9),
                            background=T["panel"], foreground=T["fg"],
                            insertbackground=T["fg"], selectbackground=T["accent"],
                            selectforeground="#000000", relief="flat",
                            borderwidth=0)
-        sb = ttk.Scrollbar(logbody, command=self.log.yview)
+        sb = ttk.Scrollbar(lf, command=self.log.yview)
         self.log.configure(yscrollcommand=sb.set)
         self.log.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
-        self.log.tag_configure("normal", foreground=T["fg"])
         self.log.tag_configure("warn", foreground=T["warn"])
-        self.log.tag_configure("conv", foreground=T["accent"])
         self.log.tag_configure("err", foreground=T["err"])
-        self.log.tag_configure("search_hit", background=T["accent"],
-                               foreground="#101215")
 
         # Live pane resizing without the render storm -- see
         # _install_resize_guard. Must run AFTER every canvas exists.
-        for c in (self.canvas, self.mcanvas, self.ccanvas):
+        for c in (self.canvas, self.mcanvas, self.ccanvas, self.ecanvas):
             self._install_resize_guard(c)
         for p in (outer, vpane):
             self._bind_sash(p)
+        outer.bind("<Configure>", self._clamp_panes, add="+")
 
         self._build_panel()
 
@@ -2704,139 +3305,10 @@ class App:
         # be checked by looking at the window -- a display that is 25% out
         # just looks slightly wrong -- so it goes in the log where --scale
         # can be aimed at it.
+        self._bind_shortcuts()
+
         if SCALE_INFO:
             self._append_log(SCALE_INFO)
-
-    def _load_gui_state(self):
-        try:
-            with open(GUI_STATE, "r", encoding="utf-8") as fh:
-                state = json.load(fh)
-            if not isinstance(state, dict):
-                raise ValueError("state is not an object")
-        except (OSError, ValueError, TypeError):
-            state = {}
-        state.setdefault("recent_configs", [])
-        state.setdefault("presets", {})
-        return state
-
-    def _save_gui_state(self):
-        tmp = GUI_STATE + ".tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(self.gui_state, fh, indent=2)
-            os.replace(tmp, GUI_STATE)
-        except OSError as exc:
-            if hasattr(self, "log"):
-                self._append_log(f"[gui] could not save recent items: {exc}\n")
-
-    @staticmethod
-    def _display_config_path(path):
-        try:
-            rel = os.path.relpath(path, PROJECT_DIR)
-            if not rel.startswith(".."):
-                return rel
-        except ValueError:
-            pass
-        return path
-
-    def _refresh_recent_configs(self):
-        if not hasattr(self, "recent_combo"):
-            return
-        self._recent_map = {
-            self._display_config_path(p): p
-            for p in self.gui_state.get("recent_configs", [])
-        }
-        self.recent_combo.configure(values=list(self._recent_map))
-        if self.recent_var.get() not in self._recent_map:
-            self.recent_var.set(next(iter(self._recent_map), ""))
-
-    def _remember_config(self, path):
-        path = os.path.abspath(path)
-        recent = [p for p in self.gui_state.get("recent_configs", [])
-                  if os.path.normcase(p) != os.path.normcase(path)]
-        self.gui_state["recent_configs"] = [path] + recent[:MAX_RECENT_CONFIGS - 1]
-        self._save_gui_state()
-        self._refresh_recent_configs()
-        self.recent_var.set(self._display_config_path(path))
-
-    def _open_recent(self):
-        path = getattr(self, "_recent_map", {}).get(self.recent_var.get())
-        if not path:
-            return
-        if not os.path.isfile(path):
-            self.gui_state["recent_configs"] = [
-                p for p in self.gui_state.get("recent_configs", [])
-                if os.path.normcase(p) != os.path.normcase(path)]
-            self._save_gui_state()
-            self._refresh_recent_configs()
-            messagebox.showwarning("Configuration missing",
-                                   f"This file is no longer available:\n{path}")
-            return
-        self.import_config(path)
-
-    def _refresh_preset_values(self):
-        if not hasattr(self, "preset_combo"):
-            return
-        saved = self.gui_state.get("presets", {})
-        self._preset_map = dict(BUILTIN_PRESETS)
-        self._preset_map.update({f"Saved: {name}": value
-                                 for name, value in sorted(saved.items())})
-        self.preset_combo.configure(values=list(self._preset_map))
-        if self.preset_var.get() not in self._preset_map:
-            self.preset_var.set(next(iter(self._preset_map), ""))
-
-    def _apply_preset(self):
-        name = self.preset_var.get()
-        values = getattr(self, "_preset_map", {}).get(name)
-        if not values:
-            return
-        if name.startswith("Saved: "):
-            self.set_form(values)
-        else:
-            for key, value in values.items():
-                var = self.vars.get(key)
-                if var is not None:
-                    var.set(value if isinstance(var, tk.BooleanVar) else str(value))
-            self._apply_visibility()
-            self._refresh_warnings()
-        self._append_log(f"[gui] applied preset: {name}\n")
-
-    def _save_current_preset(self):
-        try:
-            form = self.get_form()
-        except ValueError as exc:
-            messagebox.showerror("Cannot save preset", str(exc))
-            return
-        name = simpledialog.askstring("Save preset", "Preset name:", parent=self.root)
-        if not name or not name.strip():
-            return
-        name = name.strip()
-        self.gui_state.setdefault("presets", {})[name] = form
-        self._save_gui_state()
-        self._refresh_preset_values()
-        self.preset_var.set(f"Saved: {name}")
-        self._append_log(f"[gui] saved preset: {name}\n")
-
-    # Match gui2's restrained but useful lifecycle colouring: idle is muted,
-    # work is blue, and only an actual failure becomes red.
-    STATE_COLOUR = {"idle": "muted", "busy": "accent",
-                    "ok": "fg", "fail": "err"}
-
-    def _set_state(self, text: str, kind: str = "idle") -> None:
-        self.status.set(text)
-        try:
-            self.state_lbl.configure(
-                foreground=T[self.STATE_COLOUR.get(kind, "fg")])
-        except tk.TclError:
-            pass
-
-    def _bind_shortcuts(self):
-        """A small, conventional shortcut set for repeated simulation work."""
-        self.root.bind("<Control-o>", lambda _e: self.import_config())
-        self.root.bind("<Control-s>", lambda _e: self.save_config())
-        self.root.bind("<F5>", lambda _e: self.run())
-        self.root.bind("<Control-F5>", lambda _e: self.check_mesh())
-        self.root.bind("<Escape>", lambda _e: self.stop())
 
     # Every settings row is three columns: NAME | CONTROL | UNIT, in one grid
     # per section.
@@ -2872,43 +3344,90 @@ class App:
             self._charw = self._charw or px(7)
         return self._charw
 
+    # What each lifecycle state should look like. Colour is the point: a
+    # failed run and an idle one used to be the same shade of grey text.
+    STATE_COLOUR = {"idle": "muted", "busy": "accent",
+                    "ok": "fg", "fail": "err"}
+
+    def _set_state(self, text: str, kind: str = "idle") -> None:
+        self.state.set(text)
+        try:
+            self.state_lbl.configure(
+                foreground=T[self.STATE_COLOUR.get(kind, "fg")])
+        except tk.TclError:
+            pass
+
+    def _bind_shortcuts(self):
+        """A small, conventional shortcut set for repeated simulation work."""
+        self.root.bind("<Control-o>", lambda _e: self.import_config())
+        self.root.bind("<Control-s>", lambda _e: self.save_config())
+        self.root.bind("<F5>", lambda _e: self.run())
+        self.root.bind("<Control-F5>", lambda _e: self.check_mesh())
+        self.root.bind("<Escape>", lambda _e: self.stop())
+
+    @staticmethod
+    def _wrapping(label, parent, slack=20):
+        """Make a status Label reflow at its parent's width.
+
+        A Tk label CLIPS; it does not wrap unless told a pixel width, and a
+        fixed one is wrong at every size but the one it was chosen at. So the
+        width is re-applied whenever the parent changes size.
+
+        This is what "information disappears when the window is not maximised"
+        actually was: every status line in here ends with its numbers, so the
+        part that gets cut off is the part worth reading.
+        """
+        def _resize(event, label=label, slack=slack):
+            try:
+                label.configure(wraplength=max(px(140), event.width - slack))
+            except tk.TclError:
+                pass
+        parent.bind("<Configure>", _resize, add="+")
+        return label
+
     def _section(self, title, expanded=True):
-        """Create a compact section with a useful summary while collapsed."""
+        """A section whose heading opens and closes it.
+
+        THE RISK OF COLLAPSING A FORM is that you hide a setting you got
+        wrong, so a closed section here still shows a one-line summary of what
+        is inside it. Nothing about the run becomes invisible; it becomes
+        smaller. That is also why the summary is generated from the live
+        variables rather than written once -- a stale summary would be worse
+        than no summary at all.
+        """
         shell = ttk.Frame(self.panel)
         shell.pack(fill="x", padx=px(6), pady=px(3))
-        button = ttk.Button(
-            shell, style="Section.TButton",
-            command=lambda t=title: self._set_section_expanded(
-                t, not self._sections[t]["expanded"]))
+        button = ttk.Button(shell, style="Section.TButton",
+                            command=lambda t=title: self._set_section_expanded(
+                                t, not self._sections[t]["expanded"]))
         button.pack(fill="x")
         summary = ttk.Label(shell, foreground=T["muted"], anchor="w",
                             wraplength=px(400), justify="left",
                             padding=(px(11), px(1), px(4), px(3)))
-        f = ttk.Frame(shell, padding=(px(7), px(4), px(7), px(7)))
-        self._sections[title] = {
-            "shell": shell, "button": button, "summary": summary,
-            "body": f, "expanded": bool(expanded),
-        }
+        body = ttk.Frame(shell, padding=(px(7), px(4), px(7), px(7)))
+        self._sections[title] = {"shell": shell, "button": button,
+                                 "summary": summary, "body": body,
+                                 "expanded": bool(expanded)}
 
         ch = self._char_w()
-        f.grid_columnconfigure(0, minsize=self.LABEL_COL * ch)
-        f.grid_columnconfigure(1, minsize=self.CTRL_COL * ch)
+        body.grid_columnconfigure(0, minsize=self.LABEL_COL * ch)
+        body.grid_columnconfigure(1, minsize=self.CTRL_COL * ch)
         # The slack goes to the unit column, so widening the panel opens up
         # the space AFTER the values instead of stretching every box.
-        f.grid_columnconfigure(2, weight=1)
-        f.next_row = 0
-        f.section_title = title
+        body.grid_columnconfigure(2, weight=1)
+        body.next_row = 0
+        body.section_title = title
         self._set_section_expanded(title, expanded)
-        return f
+        return body
 
     def _set_section_expanded(self, title, expanded):
         state = self._sections.get(title)
         if not state:
             return
         state["expanded"] = bool(expanded)
-        state["button"].configure(text=("−  " if expanded else "+  ") + title)
+        state["button"].configure(text=("\u2212  " if expanded else "+  ") + title)
         if expanded:
-            state["summary"].pack_forget()
+            state["summary"].pack_forget()          # the fields say it better
             if not state["body"].winfo_manager():
                 state["body"].pack(fill="x")
         else:
@@ -2918,7 +3437,7 @@ class App:
             self._refresh_section_summaries()
 
     def _v(self, key, default=""):
-        """Return a form value exactly as displayed, without raising."""
+        """A form value as the user typed it, never raising."""
         var = self.vars.get(key)
         if var is None:
             return default
@@ -2927,51 +3446,60 @@ class App:
         except tk.TclError:
             return default
 
-    def _section_summary(self, title):
-        """Describe a collapsed section without making the user reopen it."""
+    def _section_summary(self, title) -> str:
+        """One line describing a closed section, from the live variables."""
         try:
             if title.startswith("1."):
                 src = self.geom_source.get() or "no source chosen"
-                return f"{src} → {self.geom_out.get()}"
+                return f"{src} \u2192 {self.geom_out.get()}"
             if title.startswith("2."):
                 if self._v("mesh_source") != "file":
                     return "built-in mesh"
                 path = self._v("mesh_path")
                 if not path:
                     return "no mesh selected"
-                groups = f" · {len(self.mesh_groups)} groups" if self.mesh_groups else ""
+                groups = (f" \u00b7 {len(self.mesh_groups)} groups"
+                          if self.mesh_groups else "")
                 return f"{os.path.basename(path)}{groups}"
             if title.startswith("3."):
-                hyb = " · hybrid" if self._v("hybrid") in ("1", "True") else ""
-                return (f"{self._v('ntype_label')} · "
-                        f"{self._v('energy_split')} split{hyb} · "
+                hyb = " \u00b7 hybrid" if self._v("hybrid") in ("1", "True") else ""
+                return (f"{self._v('ntype_label')} \u00b7 "
+                        f"{self._v('energy_split')} split{hyb} \u00b7 "
                         f"ngaus {self._v('ngaus')}")
             if title.startswith("4."):
-                return (f"E {self._v('E')} MPa · nu {self._v('nu')} · "
-                        f"Gc {self._v('Gc')} · l0 {self._v('l0')} mm")
+                return (f"E {self._v('E')} MPa \u00b7 nu {self._v('nu')} \u00b7 "
+                        f"Gc {self._v('Gc')} \u00b7 l0 {self._v('l0')} mm")
             if title.startswith("5."):
                 rows = [b for b in self.bctable.get() if b.get("group")]
                 if not rows:
                     return "nothing restrained or loaded"
                 driven = [b for b in rows
                           if float(b.get("vx") or 0) or float(b.get("vy") or 0)]
-                lead = (f" · {driven[0]['group']} driven" if driven
-                        else " · nothing driven")
-                return f"{len(rows)} condition{'s' if len(rows) != 1 else ''}{lead}"
+                lead = (f" \u00b7 {driven[0]['group']} driven"
+                        if driven else " \u00b7 nothing driven")
+                return (f"{len(rows)} condition{'s' if len(rows) != 1 else ''}"
+                        f"{lead}")
+            if title.startswith("5b."):
+                if self._v("ih_on") not in ("1", "True"):
+                    return "none"
+                where = self._v("ih_points") or self._v("ih_group") \
+                    or "no line given"
+                return f"{where} \u00b7 B {self._v('ih_B')}"
             if title.startswith("6."):
-                sweeps = (f" · max {self._v('max_staggered')} sweeps"
+                sweeps = (f" \u00b7 max {self._v('max_staggered')} sweeps"
                           if self._v("scheme") == "staggered" else "")
-                return f"{self._v('scheme')}{sweeps} · tol_rel {self._v('tol_rel')}"
+                return (f"{self._v('scheme')}{sweeps} \u00b7 "
+                        f"tol_rel {self._v('tol_rel')}")
             if title.startswith("7."):
                 mode = self._v("step_mode")
                 try:
                     plan = planned_steps(self.get_form())
                 except (ValueError, KeyError, TypeError):
                     plan = None
-                count = f" · {plan[0]:,} steps" if plan else ""
+                count = f" \u00b7 {plan[0]:,} steps" if plan else ""
                 return f"{mode}{count}"
             if title.startswith("8."):
-                return (f"{self._v('output_dir')}/{self._v('base_name')} · "
+                return (f"{self._v('output_dir')}/{self._v('base_name')} \u00b7 "
                         f"VTK every {self._v('vtk_every')}")
         except Exception:
             pass
@@ -2981,6 +3509,17 @@ class App:
         for title, state in self._sections.items():
             if not state["expanded"]:
                 state["summary"].configure(text=self._section_summary(title))
+
+    def _reveal_field(self, key):
+        """Open whichever section holds `key`.
+
+        A validation message about a field you cannot see is a dead end, so
+        anything the form complains about opens itself.
+        """
+        title = self._field_section.get(key)
+        if title and title in self._sections \
+                and not self._sections[title]["expanded"]:
+            self._set_section_expanded(title, True)
 
     def _field(self, parent, label, key, kind="entry", values=None,
                on_change=None, unit="", help=""):
@@ -3011,29 +3550,17 @@ class App:
             w.grid(row=r, column=1, sticky="ew", pady=px(2))
         cells.append(w)
         self.vars[key] = v
-        if kind != "check":
-            self._field_widgets[key] = w
-            self._field_sections[key] = getattr(parent, "section_title", "")
         if unit:
-            u = ttk.Label(parent, text=unit, foreground=T["muted"], anchor="w",
-                          wraplength=px(170))
+            u = ttk.Label(parent, text=unit, foreground=T["muted"], anchor="w")
             u.grid(row=r, column=2, sticky="w", padx=(px(6), 0))
             cells.append(u)
-        else:
-            # Normally empty; becomes the short, field-specific explanation
-            # when validation fails.
-            u = ttk.Label(parent, text="", foreground=T["muted"], anchor="w",
-                          wraplength=px(170))
-            u.grid(row=r, column=2, sticky="w", padx=(px(6), 0))
-            cells.append(u)
-        self._field_feedback[key] = (u, unit)
-        v.trace_add("write", lambda *_args: self._schedule_validation())
         if help:
             for c in cells:
                 Tip(c, help)
         # Every widget of the row, so _apply_visibility can take the whole
         # thing out and put it back exactly where it was.
         self._rows[key] = cells
+        self._field_section[key] = getattr(parent, "section_title", "")
         return v
 
     def _note(self, parent, text="", var=None, warn=False):
@@ -3070,9 +3597,22 @@ class App:
                 self.vars["mesh_source"].get() != "file":
             hide.add("mesh_path")
 
+        if self.vars.get("ih_on") is not None:
+            try:
+                ih_on = bool(self.vars["ih_on"].get())
+            except tk.TclError:
+                ih_on = False
+            if not ih_on:
+                hide |= {"ih_points", "ih_group", "ih_B", "ih_half_width"}
+
         # A monolithic solve has no staggered loop to bound or to stop.
         if self.vars.get("scheme") and self.vars["scheme"].get() != "staggered":
-            hide |= {"max_staggered", "stagger_stop", "gamma_tol"}
+            hide |= {"max_staggered", "stagger_stop", "gamma_tol",
+                     "phi_bounds", "irreversibility", "phi_active_set_max_iter"}
+        elif self.vars.get("phi_bounds") and \
+                self.vars["phi_bounds"].get() == "none":
+            # irreversibility = bounds is only valid with a constraint
+            hide |= {"irreversibility", "phi_active_set_max_iter"}
         elif self.vars.get("stagger_stop") and \
                 self.vars["stagger_stop"].get() != "energy":
             hide.add("gamma_tol")        # the angle tolerance IS the criterion
@@ -3093,8 +3633,6 @@ class App:
                 w.grid_remove() if key in hide else w.grid()
 
     def _build_panel(self):
-        # Keep gui3's recent-project and preset tools, but present them with
-        # gui2's compact, utility-first hierarchy.
         top = ttk.Frame(self.panel, padding=(px(6), px(6), px(6), 0))
         top.pack(fill="x")
         btns = ttk.Frame(top)
@@ -3107,39 +3645,12 @@ class App:
                   foreground=T["muted"], wraplength=px(400),
                   justify="left").pack(anchor="w", pady=(px(2), 0))
 
-        recent = ttk.Frame(top)
-        recent.pack(fill="x", pady=(px(8), 0))
-        ttk.Label(recent, text="Recent", width=9, anchor="w").pack(side="left")
-        self.recent_var = tk.StringVar()
-        self.recent_combo = ttk.Combobox(recent, textvariable=self.recent_var,
-                                         width=27, state="readonly")
-        self.recent_combo.pack(side="left", fill="x", expand=True)
-        self.recent_combo.bind("<<ComboboxSelected>>",
-                               lambda _e: self._open_recent())
-        ttk.Button(recent, text="Open", width=6,
-                   command=self._open_recent).pack(side="left", padx=(px(4), 0))
-
-        presets = ttk.Frame(top)
-        presets.pack(fill="x", pady=(px(4), 0))
-        ttk.Label(presets, text="Preset", width=9, anchor="w").pack(side="left")
-        self.preset_var = tk.StringVar(value="Robust staggered")
-        self.preset_combo = ttk.Combobox(presets, textvariable=self.preset_var,
-                                         width=20, state="readonly")
-        self.preset_combo.pack(side="left", fill="x", expand=True)
-        ttk.Button(presets, text="Apply", width=6,
-                   command=self._apply_preset).pack(side="left", padx=(px(4), 0))
-        ttk.Button(presets, text="Save current", width=11,
-                   command=self._save_current_preset).pack(side="left", padx=(px(4), 0))
-        self._refresh_recent_configs()
-        self._refresh_preset_values()
-
-        summary = ttk.Frame(self.panel, padding=(px(7), px(3)))
-        summary.pack(fill="x", padx=px(6), pady=(px(2), px(1)))
-        self.summary_var = tk.StringVar(value="Complete the setup to see a run summary.")
-        ttk.Label(summary, textvariable=self.summary_var, foreground=T["muted"],
-                  justify="left", wraplength=px(430)).pack(anchor="w")
-
         # ---- Geometry: build a mesh, rather than only pointing at one ------
+        # Open by default only what changes from run to run. The mesher in
+        # section 1 builds a mesh once and is then done with; the model,
+        # solver tolerances and output stride are study-level settings. Each
+        # closed section still states its contents in one line, so nothing is
+        # hidden -- only made smaller.
         g = self._section("1. Geometry", expanded=False)
         ttk.Label(g, text="source", anchor="w").grid(row=0, column=0,
                                                      sticky="w", pady=px(2))
@@ -3181,7 +3692,7 @@ class App:
         self._note(g, "runs the mesher as a separate process; the log is "
                       "below and the result loads into section 2")
 
-        s = self._section("2. Mesh", expanded=True)
+        s = self._section("2. Mesh")
         self._field(s, "source", "mesh_source", kind="combo",
                     values=["file", "builtin"],
                     on_change=self._apply_visibility)
@@ -3197,16 +3708,7 @@ class App:
         ent.grid(row=r, column=1, sticky="ew", pady=px(2))
         btn = ttk.Button(s, text="...", width=3, command=self._pick_mesh)
         btn.grid(row=r, column=2, sticky="w", padx=(px(6), 0))
-        er = s.next_row; s.next_row = er + 1
-        mesh_feedback = ttk.Label(s, text="", foreground=T["muted"], anchor="w",
-                                  wraplength=px(230))
-        mesh_feedback.grid(row=er, column=1, columnspan=2, sticky="w")
-        self._rows["mesh_path"] = [lbl, ent, btn, mesh_feedback]
-        self._field_widgets["mesh_path"] = ent
-        self._field_feedback["mesh_path"] = (mesh_feedback, "")
-        self._field_sections["mesh_path"] = getattr(s, "section_title", "")
-        self.vars["mesh_path"].trace_add(
-            "write", lambda *_args: self._schedule_validation())
+        self._rows["mesh_path"] = [lbl, ent, btn]
         self.mesh_info = tk.StringVar(value="")
         self._note(s, var=self.mesh_info)
         self._field(s, "base_name", "base_name",
@@ -3218,9 +3720,16 @@ class App:
         self._field(s, "energy_split", "energy_split", kind="combo",
                     values=SPLITS)
         self._field(s, "hybrid", "hybrid", kind="check")
+        self._field(s, "crack_model", "crack_model", kind="combo",
+                    values=CRACK_MODELS,
+                    help="AT2 (default): Gc(phi^2/(2 l0) + l0/2 |grad phi|^2); "
+                         "damage from the start.\n"
+                         "AT1: 3Gc/8 (phi/l0 + l0 |grad phi|^2); linear-elastic "
+                         "until psi+ = 3Gc/(16 l0). Needs phi >= 0: the solver "
+                         "switches phi_bounds to active_set automatically.")
         self._field(s, "ngaus", "ngaus", unit="per direction")
 
-        s = self._section("4. Material", expanded=True)
+        s = self._section("4. Material")
         self._field(s, "name", "mat_name")
         self._field(s, "E", "E", unit="MPa")
         self._field(s, "nu", "nu")
@@ -3229,7 +3738,7 @@ class App:
         self._field(s, "k", "k", unit="residual stiffness")
         self._field(s, "domain group", "domain")
 
-        s = self._section("5. Restraints and loads", expanded=True)
+        s = self._section("5. Restraints and loads")
         self.bctable = LoadTable(s, lambda: self.mesh_groups.keys(),
                                  on_change=self._bcs_changed)
         self._wide(s, self.bctable)
@@ -3238,6 +3747,36 @@ class App:
                    "force: N at a point (0D) group\n"
                    "traction: N per mm of edge, on an edge (1D) group\n"
                    "all are scaled by the load factor each step")
+
+        s = self._section("5b. Initial crack (history field)", expanded=False)
+        self._field(s, "pre-crack", "ih_on", kind="check",
+                    help="Seed a crack through the history field "
+                         "([[initial_history]], Borden et al. 2012). H0 = "
+                         "B*Hc*(1 - d/w) near the line; phi is solved once at "
+                         "zero load, so the crack exists from step 0 and "
+                         "never heals (history and bounds modes).")
+        self._field(s, "points", "ih_points", unit="x y; x y; ... mm",
+                    help="Crack polyline in model coordinates, e.g.\n"
+                         "44 8; 44 10   (a 2 mm crack above a notch tip at "
+                         "(44, 8)).\nNo mesh change needed -- but the mesh "
+                         "must be fine (h <= l0/3) around the line.")
+        self._field(s, "1D group", "ih_group", unit="optional",
+                    help="Name of a meshed 1D physical group to use as the "
+                         "crack line (instead of, or as well as, points).")
+        self._field(s, "B", "ih_B", unit="default 1000",
+                    help="Amplification: phi = B/(1+B) on the line (AT2). "
+                         "1000 = Borden's value. 100 gives the exact "
+                         "exp(-d/l0) profile but leaves phi ~0.96.")
+        self._field(s, "half_width", "ih_half_width", unit="mm, 0 = l0/4",
+                    help="Width w of the band where H0 is set.")
+        self.vars["ih_on"].trace_add("write",
+                                     lambda *_a: self._ih_changed())
+        for key in ("ih_points", "ih_group"):
+            ent = self._rows[key][1]
+            ent.bind("<FocusOut>", lambda _e: self._ih_changed())
+            ent.bind("<Return>", lambda _e: self._ih_changed())
+        self._note(s, "the dashed red line on the mesh view shows where the "
+                      "crack goes")
 
         s = self._section("6. Solver", expanded=False)
         self._field(s, "scheme", "scheme", kind="combo", values=SCHEMES,
@@ -3249,12 +3788,26 @@ class App:
         self._field(s, "tol_rel", "tol_rel")
         self._field(s, "tol_abs", "tol_abs")
         self._field(s, "max_iter", "max_iter")
+        self._field(s, "phi_bounds", "phi_bounds", kind="combo",
+                    values=PHI_BOUNDS, on_change=self._apply_visibility,
+                    help="Box constraint phi_n <= phi <= 1 in the phi-solve.\n"
+                         "none: not enforced (original).\n"
+                         "active_set: fix violating nodes at their bound, "
+                         "release nodes whose residual has the wrong sign, "
+                         "repeat until the set stops changing. Exact.")
+        self._field(s, "irreversibility", "irreversibility", kind="combo",
+                    values=IRREVERSIBILITY,
+                    help="history: phi driven by H = max(H_n, psi+) (original).\n"
+                         "bounds: phi driven by psi+ directly; healing is "
+                         "prevented only by phi >= phi_n. Needs active_set.")
+        self._field(s, "phi_active_set_max_iter", "phi_active_set_max_iter",
+                    unit="passes")
 
         # The qualifiers that used to sit in these labels -- "(uniform)",
         # "(3-stage)" -- are gone because _visible_keys already hides each
         # field in the modes where it does nothing. A field you can see is a
         # field this mode uses; that is a stronger statement than a bracket.
-        s = self._section("7. Load stepping", expanded=True)
+        s = self._section("7. Load stepping")
         self._field(s, "step_mode", "step_mode", kind="combo",
                     values=STEP_MODES, on_change=self._apply_visibility)
         self._field(s, "du", "du", unit="mm")
@@ -3272,12 +3825,6 @@ class App:
         self._field(s, "profile_every", "profile_every", unit="steps, 0 = off")
         self._field(s, "write_log", "write_log", kind="check")
 
-        self.validation_state = tk.StringVar(value="Checking configuration...")
-        self.validation_label = ttk.Label(self.panel,
-                                          textvariable=self.validation_state,
-                                          style="Warning.TLabel",
-                                          padding=(px(8), px(4)))
-        self.validation_label.pack(fill="x", padx=px(6), pady=(px(4), 0))
         self.warnbox = tk.Text(self.panel, height=7, width=20, wrap="word",
                                font=("TkDefaultFont", 8), foreground=T["warn"],
                                background=T["warnbg"], relief="flat",
@@ -3290,7 +3837,7 @@ class App:
               "#ffd32a", "#7bed9f", "#eccc68"]
 
     # -- geometry -------------------------------------------------------
-    def _geom_source_changed(self, _event=None, cad_path=None):
+    def _geom_source_changed(self, _event=None):
         """Rebuild the parameter fields for the newly chosen source."""
         for w in self.geom_param_frame.winfo_children():
             w.destroy()
@@ -3299,7 +3846,7 @@ class App:
         src = self.geom_source.get()
 
         if src.startswith("STEP"):
-            path = cad_path or filedialog.askopenfilename(
+            path = filedialog.askopenfilename(
                 initialdir=PROJECT_DIR, title="Select a CAD file",
                 filetypes=[("CAD", "*.step *.stp *.iges *.igs *.brep"),
                            ("All files", "*.*")])
@@ -3307,80 +3854,47 @@ class App:
                 self.geom_source.set("")
                 return
             self.geom_cad = path
-
-            cad = ttk.LabelFrame(self.geom_param_frame, text="CAD file",
-                                 padding=(px(7), px(6)))
-            cad.pack(fill="x", pady=(px(2), px(3)))
-            cad.grid_columnconfigure(0, weight=1)
-            cad_name = tk.StringVar(value=path)
-            cad_entry = ttk.Entry(cad, textvariable=cad_name, state="readonly")
-            cad_entry.grid(row=0, column=0, sticky="ew")
-            ttk.Button(cad, text="Change...", style="Tool.TButton",
-                       command=self._change_step_cad).grid(
-                           row=0, column=1, padx=(px(5), 0))
-            Tip(cad_entry, path)
-
-            def prepare_grid(parent):
-                parent.grid_columnconfigure(0, minsize=self.LABEL_COL * self._char_w())
-                parent.grid_columnconfigure(1, minsize=self.CTRL_COL * self._char_w())
-                parent.grid_columnconfigure(2, weight=1)
-                parent.next_row = 0
-
-            def field(parent, label, key, default, unit="", help=""):
-                row = parent.next_row
-                parent.next_row += 1
-                lbl = ttk.Label(parent, text=label, anchor="w")
-                lbl.grid(row=row, column=0, sticky="w", pady=px(2))
+            ttk.Label(self.geom_param_frame, text=os.path.basename(path),
+                      foreground=T["muted"], wraplength=px(430)).pack(anchor="w")
+            def field(label, key, default, hint="", help="", parent=None):
+                r = ttk.Frame(parent or self.geom_param_frame)
+                r.pack(fill="x", pady=1)
+                lbl = ttk.Label(r, text=label, width=17)
+                lbl.pack(side="left")
                 v = tk.StringVar(value=default)
-                ent = ttk.Entry(parent, textvariable=v, width=self.CTRL_COL)
-                ent.grid(row=row, column=1, sticky="ew", pady=px(2))
-                if unit:
-                    ttk.Label(parent, text=unit, foreground=T["muted"],
-                              anchor="w").grid(row=row, column=2, sticky="w",
-                                               padx=(px(6), 0), pady=px(2))
+                ent = ttk.Entry(r, textvariable=v, width=10,
+                                style="Cell.TEntry")
+                ent.pack(side="left")
+                if hint:
+                    ttk.Label(r, text=hint, foreground=T["muted"]).pack(
+                        side="left", padx=4)
                 if help:
                     Tip(lbl, help); Tip(ent, help)
                 self.geom_vars[key] = v
 
-            settings = ttk.LabelFrame(self.geom_param_frame, text="Mesh settings",
-                                      padding=(px(7), px(5)))
-            settings.pack(fill="x", pady=px(3))
-            prepare_grid(settings)
-            field(settings, "bulk size h", "h", "0.15", "CAD units",
-                  "Target element size away from locally refined regions.")
-
-            row = settings.next_row
-            settings.next_row += 1
-            ttk.Label(settings, text="elements", anchor="w").grid(
-                row=row, column=0, sticky="w", pady=px(2))
+            ttk.Label(self.geom_param_frame,
+                      text="all coordinates, sizes and distances below are in "
+                           "MILLIMETRES - the same units as the CAD file and "
+                           "the config",
+                      foreground=T["warn"], wraplength=px(470)).pack(anchor="w",
+                                                                 pady=(2, 4))
+            field("bulk size h", "h", "0.15")
+            row = ttk.Frame(self.geom_param_frame); row.pack(fill="x", pady=1)
+            ttk.Label(row, text="elements", width=17).pack(side="left")
             ev = tk.StringVar(value="quad4")
-            cb = ttk.Combobox(settings, textvariable=ev, values=ELEMENTS,
-                              width=self.CTRL_COL - 2, state="readonly")
-            cb.grid(row=row, column=1, sticky="ew", pady=px(2))
+            cb = ttk.Combobox(row, textvariable=ev, values=ELEMENTS, width=8,
+                              state="readonly", style="Cell.TCombobox")
+            cb.pack(side="left")
             Tip(cb, "The only three element types the solver's reader accepts. "
                     "quad8 needs fem.ngaus = 3. Changing element type changes "
                     "the ANSWER, not just the discretisation -- tri3 is "
                     "noticeably stiffer than quad4 at the same size.")
             self.geom_vars["elements"] = ev
-
-            row = settings.next_row
-            settings.next_row += 1
             v = tk.BooleanVar(value=True)
-            ttk.Label(settings, text="boundary groups", anchor="w").grid(
-                row=row, column=0, sticky="w", pady=px(2))
-            sides = ttk.Checkbutton(settings,
-                                    text="Left / Right / Top / Bottom",
-                                    variable=v)
-            sides.grid(row=row, column=1, columnspan=2, sticky="w", pady=px(2))
-            Tip(sides, "Create named physical groups for the four outer sides.")
+            ttk.Checkbutton(self.geom_param_frame,
+                            text="name outer edges Left/Right/Top/Bottom",
+                            variable=v).pack(anchor="w", pady=(2, 0))
             self.geom_vars["auto_sides"] = v
-
-            ttk.Label(self.geom_param_frame,
-                      text="Coordinates, sizes, and distances use the CAD file's "
-                           "units (normally millimetres).",
-                      foreground=T["muted"], wraplength=px(470),
-                      justify="left").pack(anchor="w", padx=px(7),
-                                           pady=(px(2), px(4)))
 
             # One table per repeatable argument, each with the plain fields
             # that belong to it. Cracks and refinement are not optional extras:
@@ -3390,21 +3904,15 @@ class App:
             self.geom_tables = {}
             for title, flag, hint, tmpl, cols, *rest in GEOM_TABLES:
                 box = ttk.LabelFrame(self.geom_param_frame, text=title,
-                                     padding=(px(7), px(5)))
+                                     padding=px(5))
                 box.pack(fill="x", pady=3)
                 t = SpecTable(box, cols, tmpl, hint=hint,
                               legacy=(rest[0] if rest else ()))
                 t.pack(fill="x")
                 t.flag = flag
                 self.geom_tables[title] = t
-                extras = GEOM_EXTRAS.get(title, ())
-                if extras:
-                    extra_grid = ttk.Frame(box)
-                    extra_grid.pack(fill="x", pady=(px(4), 0))
-                    prepare_grid(extra_grid)
-                    for label, key, default, help_ in extras:
-                        field(extra_grid, label, key, default,
-                              "CAD units", help_)
+                for label, key, default, help_ in GEOM_EXTRAS.get(title, ()):
+                    field(label, key, default, help=help_, parent=box)
 
             self.geom_out.set("meshes/" +
                               os.path.splitext(os.path.basename(path))[0] + ".msh")
@@ -3431,16 +3939,6 @@ class App:
                           foreground=T["muted"]).pack(side="left", padx=4)
             self.geom_vars[name] = v
         self.geom_out.set("meshes/" + os.path.splitext(src)[0] + ".msh")
-
-    def _change_step_cad(self):
-        """Choose another CAD file while keeping the STEP source selected."""
-        path = filedialog.askopenfilename(
-            initialdir=os.path.dirname(self.geom_cad) or PROJECT_DIR,
-            title="Select a CAD file",
-            filetypes=[("CAD", "*.step *.stp *.iges *.igs *.brep"),
-                       ("All files", "*.*")])
-        if path:
-            self._geom_source_changed(cad_path=path)
 
     def generate_mesh(self):
         src = self.geom_source.get()
@@ -3570,6 +4068,7 @@ class App:
     def _bcs_changed(self):
         """A BC row was added, removed or edited."""
         self._mesh_dirty = True
+        self._refresh_section_summaries()
         self._refresh_warnings()
         # Debounce: typing a group name fires once per KEYSTROKE, and each
         # redraw is ~0.3 s. Coalesce into one redraw 300 ms after you stop.
@@ -3636,6 +4135,31 @@ class App:
         except Exception:
             pass
 
+    def _clamp_panes(self, _event=None):
+        """Stop the settings pane eating the results column.
+
+        A PanedWindow remembers its sash in PIXELS. A pane sized against a
+        maximised window keeps exactly that width when the window is made
+        small, so ALL of the shrinkage lands on the column to its right -- at
+        860 px the results side was down to about 280 px and its control rows
+        were simply cut off. That is what "information disappears when the
+        window is not fully opened" was.
+
+        Fires only when the PANED WINDOW itself is resized, not when a sash is
+        dragged, so it never fights you: drag the settings pane as wide as you
+        like and it stays there until the window itself gets smaller.
+        """
+        try:
+            total = self.paned.winfo_width()
+            if total <= 1:
+                return
+            cap = max(px(300), int(0.45 * total))
+            x, _y = self.paned.sash_coord(0)
+            if x > cap:
+                self.paned.sash_place(0, cap, 0)
+        except (tk.TclError, ValueError, IndexError):
+            pass
+
     def _bind_sash(self, pane):
         pane.bind("<ButtonPress-1>",
                   lambda e, p=pane: self._sash_press(e, p), add="+")
@@ -3651,18 +4175,11 @@ class App:
             on_sash = True
         if on_sash:
             self._dragging = True
-            self._dragging_pane = pane
-            if pane is self.paned:
-                self.panel_host.set_live_resize(True)
 
     def _sash_release(self, _event=None):
         if not self._dragging:
             return
-        pane = self._dragging_pane
         self._dragging = False
-        self._dragging_pane = None
-        if pane is self.paned:
-            self.panel_host.set_live_resize(False)
         # Anything the drag suppressed catches up now.
         self._last_plot = 0.0
         pending, self._resize_pending = self._resize_pending, set()
@@ -3697,7 +4214,7 @@ class App:
         self._laid_out[id(fig)] = full
 
     def _curve_interacted(self, _event=None):
-        """A toolbar pan or zoom holds the chosen curve view."""
+        """A toolbar zoom or pan on the curve turns following off."""
         mode = str(getattr(self.curve_toolbar, "mode", "") or "")
         if mode and self.follow_curve.get():
             self.follow_curve.set(False)
@@ -3711,7 +4228,7 @@ class App:
             self.curve_hint.set("view held - press Fit to follow again")
 
     def fit_curve(self):
-        """Fit the complete curve and resume following new data."""
+        """Back to the whole curve, and following again."""
         self.follow_curve.set(True)
         self.curve_hint.set("")
         self._refresh_plot(force=True)
@@ -3722,41 +4239,12 @@ class App:
                 self.draw_mesh(preserve_view=True)
             elif self.nb.select() == str(self.crack_tab):
                 self.draw_crack()
+            elif self.nb.select() == str(self.energy_tab):
+                self.draw_energy(force=True)
         except Exception:
             pass
 
     # -- crack view -----------------------------------------------------
-    def _layout_crack_controls(self, event=None, width=None):
-        """Keep the crack toolbar to one row whenever its width permits it."""
-        if width is None:
-            width = getattr(event, "width", self.crack_nav.master.winfo_width())
-        if width >= px(840):
-            mode = "one"
-        elif width >= px(570):
-            mode = "two"
-        else:
-            mode = "three"
-        if mode == self._crack_controls_mode:
-            return
-        self._crack_controls_mode = mode
-        for frame in (self.crack_nav, self.crack_options, self.crack_display):
-            frame.pack_forget()
-
-        if mode == "one":
-            self.crack_nav.pack(side="left")
-            self.crack_options.pack(side="left", padx=(px(5), 0))
-            self.crack_display.pack(side="left", fill="x", expand=True)
-        elif mode == "two":
-            self.crack_nav.pack(side="top", fill="x")
-            self.crack_options.pack(side="left", padx=(0, px(5)),
-                                    pady=(px(3), 0))
-            self.crack_display.pack(side="left", fill="x", expand=True,
-                                    pady=(px(3), 0))
-        else:
-            self.crack_nav.pack(side="top", fill="x")
-            self.crack_options.pack(side="top", fill="x", pady=(px(3), 0))
-            self.crack_display.pack(side="top", fill="x", pady=(px(3), 0))
-
     def _vtk_dir(self) -> str:
         """Snapshot folder for the CURRENT form, so an old run can be opened
         without launching anything."""
@@ -3782,91 +4270,40 @@ class App:
         self._vtk_sizes[path] = size
         return was == size and size > 0
 
-    def _sync_crack_navigator(self, snapshots, selected_step=None):
-        """Update state label and navigation buttons without loading a file."""
-        self._crack_snapshots = snapshots
-        n = len(snapshots)
-        if not n:
-            self.crack_state_text.set("no states")
-            for button in (self.btn_crack_first, self.btn_crack_prev,
-                           self.btn_crack_next,
-                           self.btn_crack_latest):
-                button.configure(state="disabled")
-            return -1
+    def draw_crack(self, force=False, target=None):
+        """Draw one snapshot. `target` is a step number; None means the newest.
 
-        steps = [item[0] for item in snapshots]
-        if selected_step in steps:
-            index = steps.index(selected_step)
-        else:
-            index = n - 1
-        self.crack_state_text.set(f"{index + 1}/{n}  #{steps[index]:,}")
-        self.btn_crack_first.configure(state="normal" if index > 0 else "disabled")
-        self.btn_crack_prev.configure(state="normal" if index > 0 else "disabled")
-        self.btn_crack_next.configure(
-            state="normal" if index < n - 1 else "disabled")
-        self.btn_crack_latest.configure(
-            state="normal" if index < n - 1 else "disabled")
-        return index
-
-    def _select_crack_state(self, index):
-        snapshots = vtk_snapshots(self._vtk_dir())
-        if not snapshots:
-            self._sync_crack_navigator([])
-            return
-        index = min(max(int(index), 0), len(snapshots) - 1)
-        self.follow_crack.set(False)
-        self._sync_crack_navigator(snapshots, snapshots[index][0])
-        self.draw_crack(target_index=index)
-
-    def _move_crack_state(self, delta):
-        snapshots = vtk_snapshots(self._vtk_dir())
-        if not snapshots:
-            self._sync_crack_navigator([])
-            return
-        current = self._sync_crack_navigator(snapshots, self._crack_step)
-        self._select_crack_state(min(max(current + delta, 0), len(snapshots) - 1))
-
-    def _show_first_crack(self):
-        snapshots = vtk_snapshots(self._vtk_dir())
-        if snapshots:
-            self._select_crack_state(0)
-        else:
-            self._sync_crack_navigator([])
-
-    def _show_latest_crack(self):
-        self.follow_crack.set(True)
-        snapshots = vtk_snapshots(self._vtk_dir())
-        if snapshots:
-            self.draw_crack(target_index=len(snapshots) - 1)
-        else:
-            self._sync_crack_navigator([])
-
-    def _follow_crack_changed(self):
-        if self.follow_crack.get():
-            self._show_latest_crack()
-
-    def draw_crack(self, force=False, target_index=None):
+        The geometry is identical in every snapshot and is parsed once (see
+        read_vtk_geometry), so moving between frames costs one phi block --
+        which is what makes stepping through a run feel immediate on a mesh
+        where the first load took seconds.
+        """
         vdir = self._vtk_dir()
-        snapshots = vtk_snapshots(vdir)
-        if not snapshots:
-            self._sync_crack_navigator([])
+        snaps = list_vtk(vdir)
+        self._crack_snaps = snaps
+        if not snaps:
             self.crack_stats.set(
                 "no snapshots yet" if not vdir else f"no .vtk files in {vdir}")
+            self.crack_pos.set("")
             return
-
-        if target_index is None:
-            steps = [item[0] for item in snapshots]
-            if not self.follow_crack.get() and self._crack_step in steps:
-                target_index = steps.index(self._crack_step)
-            else:
-                target_index = len(snapshots) - 1
-        target_index = min(max(int(target_index), 0), len(snapshots) - 1)
-        step, path = snapshots[target_index]
-        self._sync_crack_navigator(snapshots, step)
-
-        # Only the newest file can still be in the middle of being written.
-        if target_index == len(snapshots) - 1 and not self._stable(path) and not force:
-            return                       # still being written; try again shortly
+        if target is None:
+            index = len(snaps) - 1
+        else:
+            # Nearest available step, not an exact match: vtk_every can change
+            # between runs and a remembered step may no longer exist.
+            index = min(range(len(snaps)),
+                        key=lambda i: abs(snaps[i][0] - target))
+        step, path = snaps[index]
+        # Only the NEWEST file can be half-written, and only the AUTOMATIC
+        # path has to wait for it: _maybe_follow_crack looks again twice a
+        # second, so a snapshot the solver is still writing costs nothing to
+        # skip. An explicit request reads now -- older frames finished long
+        # ago, and a frame that HAS just appeared would otherwise need the
+        # button pressed twice, silently doing nothing the first time. A torn
+        # read on that path is reported by _crack_loaded and self-corrects.
+        if (target is None and index == len(snaps) - 1
+                and not self._stable(path) and not force):
+            return
         if self._crack_loading_path == path:
             return
         self._crack_request += 1
@@ -3875,22 +4312,75 @@ class App:
         self.crack_stats.set(f"loading step {step}...")
         threading.Thread(
             target=self._read_crack_worker,
-            args=(request, path, step, force, self._tri, self._tri_npoin),
+            args=(request, path, step, force, self._tri, self._tri_npoin,
+                  self._tri_polys, self._tri_cells,
+                  self.field_var.get() or "phi",
+                  self.deform_var.get() != "undeformed"),
             daemon=True).start()
 
-    def _read_crack_worker(self, request, path, step, force, tri, npoin):
+    # -- moving through the snapshots -----------------------------------
+    def _crack_index(self) -> int:
+        """Where the frame on screen sits in the snapshot list."""
+        for i, (st, _p) in enumerate(self._crack_snaps):
+            if st == self._crack_step:
+                return i
+        return len(self._crack_snaps) - 1
+
+    def _crack_go(self, delta=None, index=None):
+        # Re-listed on every move, not reused from the last draw: during a
+        # solve the folder grows underneath you, and a cached list meant ">|"
+        # took you to whatever was newest when you last looked rather than to
+        # what is newest now.
+        snaps = list_vtk(self._vtk_dir()) or self._crack_snaps
+        self._crack_snaps = snaps
+        if not snaps:
+            self.draw_crack()
+            return
+        if index is None:
+            index = self._crack_index() + (delta or 0)
+        index = max(0, min(index, len(snaps) - 1))
+        # Stepping back IS the instruction to stop following, the same way
+        # reaching for the zoom is on the curve tab -- otherwise the next
+        # snapshot the solver writes would yank you to the end again, which is
+        # the one thing you were trying to get away from. Landing on the last
+        # frame puts you at the live end, so following resumes there.
+        self.follow_crack.set(index == len(snaps) - 1)
+        self.draw_crack(target=snaps[index][0])
+
+    def crack_first(self):
+        self._crack_go(index=0)
+
+    def crack_prev(self):
+        self._crack_go(delta=-1)
+
+    def crack_next(self):
+        self._crack_go(delta=+1)
+
+    def crack_last(self):
+        self._crack_go(index=1 << 30)      # clamped to the end of the list
+
+    def _read_crack_worker(self, request, path, step, force, tri, npoin,
+                           polys, cells, field, want_disp):
+        where, disp = "point", None
         try:
             with self._io_lock:
                 if tri is None:
-                    tri, npoin = read_vtk_geometry(path)
-                phi = read_vtk_phi(path, npoin)
+                    tri, npoin, polys, cells = read_vtk_geometry(path)
+                nelem = 0 if polys is None else len(polys)
+                values, where = read_vtk_field(path, field, npoin, nelem)
+                # Read here, on the worker, rather than lazily on the Tk
+                # thread the moment someone picks a magnification.
+                if want_disp:
+                    disp = read_vtk_displacement(path, npoin)
             error = ""
-        except (OSError, ValueError, IndexError) as exc:
-            phi, error = None, str(exc)
+        except (OSError, ValueError, IndexError, KeyError) as exc:
+            values, error = None, str(exc)
         self.io_q.put((self._crack_loaded,
-                       (request, path, step, force, tri, npoin, phi, error)))
+                       (request, path, step, force, tri, npoin, polys, cells,
+                        values, where, field, disp, error)))
 
-    def _crack_loaded(self, request, path, step, force, tri, npoin, phi, error):
+    def _crack_loaded(self, request, path, step, force, tri, npoin, polys,
+                      cells, values, where, field, disp, error):
         if self._crack_loading_path == path:
             self._crack_loading_path = ""
         if request != self._crack_request:
@@ -3900,16 +4390,31 @@ class App:
             if step != self._crack_step:
                 self.crack_stats.set(f"waiting for step {step} ({error})")
             return
-        self._tri, self._tri_npoin = tri, npoin
-        self._render_crack(path, step, phi, force)
+        self._tri, self._tri_npoin, self._tri_polys = tri, npoin, polys
+        self._tri_cells = cells
+        self._crack_last = (path, step, values, where, field, disp)
+        self._render_crack(path, step, values, where, field, disp, force)
 
-    def _render_crack(self, path, step, phi, force=False):
+    def _render_crack(self, path, step, values, where="point", field="phi",
+                      disp=None, force=False):
         """Draw VTK data that was parsed away from Tk's event thread."""
 
         try:
             iso = float(self.iso_var.get())
         except ValueError:
             iso = 0.9
+        spec = CRACK_FIELDS.get(field, CRACK_FIELDS["phi"])
+
+        # The geometry everything below is drawn on. Zero means the reference
+        # shape and nothing changes; otherwise every node moves to x + s*u and
+        # the CONNECTIVITY is reused untouched -- deformation moves nodes, it
+        # does not re-mesh, so the triangles and the elements are the same
+        # ones and only their corners have moved.
+        scale = self._deform_scale(disp)
+        dx, dy = self._deformed_xy(disp, scale)
+        tri = (self._tri if scale <= 0.0
+               else mtri.Triangulation(dx, dy, self._tri.triangles))
+        self._crack_scale = scale
 
         keep = self.cax.get_xlim(), self.cax.get_ylim()
         had_view = self._crack_step >= 0
@@ -3923,16 +4428,77 @@ class App:
         # [0, 1] falls into no level and is left UNPAINTED. That punches a hole
         # straight through the middle of the crack, which is exactly the region
         # being looked at. "both" clamps them to the end colours instead.
-        cmap = self.cmap_var.get() or "inferno"
-        cs = self.cax.tricontourf(self._tri, phi,
-                                  levels=np.linspace(0.0, 1.0, 11),
-                                  cmap=cmap, extend="both")
-        if phi.max() >= iso:
+        cmap = self.cmap_var.get() or ("coolwarm" if spec["signed"]
+                                       else "inferno")
+        if field == "phi":
+            cs = self.cax.tricontourf(tri, values,
+                                      levels=np.linspace(0.0, 1.0, 11),
+                                      cmap=cmap, extend="both")
+        else:
+            # Everything else has no natural fixed range, so it is scaled to
+            # the frame.
+            #
+            # A SIGNED field is CENTRED on zero, not forced symmetric about
+            # it. Symmetric was the obvious thing and it was wrong: uy on this
+            # run spans -0.126 to +0.0046, so padding it out to +/-0.126 threw
+            # away HALF the colourmap -- 51.8% of the bar carried data and the
+            # structure worth seeing was squeezed into the bottom half. A
+            # two-slope norm keeps zero on the neutral colour, which is the
+            # whole point of a diverging map, AND runs the full colour range
+            # out to each end of the real data. The two sides then have
+            # different value-per-colour, which is exactly what you are asking
+            # for when you say "put zero in the middle".
+            lo, hi = float(np.min(values)), float(np.max(values))
+            norm = None
+            if hi <= lo:
+                # A frame where the field is uniform -- step 0 of a
+                # displacement run is all zeros. contourf cannot take a
+                # degenerate range, so open it slightly rather than raise.
+                lo, hi = lo - 0.5, hi + 0.5
+            elif spec["signed"] and lo < 0.0 < hi:
+                half = 7
+                levels = np.unique(np.concatenate(
+                    [np.linspace(lo, 0.0, half + 1),
+                     np.linspace(0.0, hi, half + 1)]))
+                norm = TwoSlopeNorm(vmin=lo, vcenter=0.0, vmax=hi)
+            if norm is None:
+                # Includes a signed field that never crosses zero: everything
+                # in tension, or a displacement that only went one way. Half a
+                # diverging map is then the honest picture -- it says so.
+                levels = np.linspace(lo, hi, 15)
+                norm = Normalize(vmin=lo, vmax=hi)
+            if where == "point":
+                # extend="neither", unlike phi. phi genuinely overshoots its
+                # bounds (this run reaches 1.008) so its end colours are for
+                # real data; here the levels ARE the data range, so reserving
+                # an under- and an over-colour just moves both ends of the
+                # colourmap somewhere nothing is ever drawn.
+                cs = self.cax.tricontourf(tri, values, levels=levels,
+                                          cmap=cmap, norm=norm,
+                                          extend="neither")
+            else:
+                # ONE COLOUR PER ELEMENT, not a contour. Output.cpp integrates
+                # these over each element's Gauss points and writes a single
+                # value per cell; drawing them smooth would show a continuity
+                # that was never computed.
+                cs = PolyCollection(self._crack_polys(scale, dx, dy),
+                                    array=np.asarray(values), cmap=cmap,
+                                    norm=norm, edgecolors="none", zorder=0)
+                self.cax.add_collection(cs)
+                # A Collection carries no data limits of its own, so without
+                # this the axes stay at their 0..1 default and the field is
+                # drawn off screen.
+                self.cax.set_xlim(float(dx.min()), float(dx.max()))
+                self.cax.set_ylim(float(dy.min()), float(dy.max()))
+        # The iso line is a contour of PHI. On a stress field it would be a
+        # line of constant stress that happens to be numbered 0.9, which is
+        # worse than no line at all.
+        if field == "phi" and values.max() >= iso:
             # The iso-line has to stay legible against whatever map is chosen.
             # The theme accent is blue, which vanishes into viridis/cividis and
             # into the blue end of jet/turbo, so pick per map rather than
             # assuming a dark background behind the line.
-            self.cax.tricontour(self._tri, phi, levels=[iso],
+            self.cax.tricontour(tri, values, levels=[iso],
                                 colors=[ISO_COLOR.get(cmap, T["accent"])],
                                 linewidths=1.4)
         # ---- the pre-existing notch ---------------------------------------
@@ -3947,7 +4513,13 @@ class App:
         # the mid-tone at 0.55 (distinct from both the phi=0 background and the
         # phi=1 crack), cased in the map's darkest colour so it stays legible
         # wherever it crosses.
-        if self.show_notch.get():
+        # NOT drawn on a deformed shape. These segments come from the .msh
+        # as coordinates, and a coordinate on the notch maps to TWO nodes --
+        # Plugin(Crack) splits them -- which move apart as the crack opens.
+        # There is no honest single place to put the line, and the ambiguity
+        # is worst exactly where the picture is being read. Better to show
+        # nothing than to draw the notch where neither face is.
+        if self.show_notch.get() and scale <= 0.0:
             segs = self._notch_segments()
             if segs:
                 cm = matplotlib.colormaps[cmap]
@@ -3957,35 +4529,168 @@ class App:
                                                  foreground=cm(0.0))]))
 
         self.cax.set_aspect("equal", adjustable="datalim")
+        label = field + (f"  [{spec['unit']}]" if spec["unit"] else "")
         if self._cbar is None:
-            self._cbar = self.cfig.colorbar(cs, ax=self.cax, label="phi")
+            self._cbar = self.cfig.colorbar(cs, ax=self.cax, label=label)
             self._cbar.ax.yaxis.label.set_color(T["muted"])
             self._cbar.ax.tick_params(colors=T["muted"])
         else:
+            self._cbar.set_label(label)
+            self._cbar.ax.yaxis.label.set_color(T["muted"])
             # Without this the bar keeps the colours of the PREVIOUS map and
             # silently mislabels the plot.
             self._cbar.update_normal(cs)
         if had_view and not force:
             self.cax.set_xlim(*keep[0]); self.cax.set_ylim(*keep[1])
+            box = (min(keep[0]), max(keep[0]), min(keep[1]), max(keep[1]))
+        else:
+            box = None                    # the whole specimen
+        # LAST, and with the box handed to it. Two reasons it cannot go
+        # earlier: set_aspect and the restore above both move the limits, and
+        # asking matplotlib for them before a draw returns whatever they were
+        # BEFORE autoscaling -- so the overlay would cull against the wrong
+        # rectangle and, zoomed in, draw nothing at all.
+        self._draw_crack_mesh(box)
         # Key on the colourbar: adding it changes the margins, so the first
         # draw after it appears must re-solve the layout.
         self._layout(self.cfig, "cbar" if self._cbar is not None else "")
         self.ccanvas.draw_idle()
 
         self._crack_step = step
-        self._crack_path = path
-        snapshots = vtk_snapshots(self._vtk_dir())
-        if snapshots:
-            self._sync_crack_navigator(snapshots, step)
-        n_dam = int((phi >= iso).sum())
+        idx = next((i for i, (st, _p) in enumerate(self._crack_snaps)
+                    if st == step), None)
+        if idx is not None:
+            self.crack_pos.set(f"{idx + 1} / {len(self._crack_snaps)}"
+                               + ("" if self.follow_crack.get() else "  held"))
+        if field == "phi":
+            n_dam = int((values >= iso).sum())
+            head = (f"max phi = {values.max():.3f}   "
+                    f"nodes above {iso:g}: {n_dam}")
+        else:
+            unit = f" {spec['unit']}" if spec["unit"] else ""
+            head = (f"{field} = {float(np.min(values)):.4g} .. "
+                    f"{float(np.max(values)):.4g}{unit}"
+                    f"   ({'per element' if where == 'cell' else 'per node'})")
+        shape = ""
+        if scale > 0.0:
+            umax = float(np.hypot(disp[:, 0], disp[:, 1]).max())
+            shape = (f"   deformed x{scale:.4g}"
+                     f" (max |u| = {umax:.4g} mm)")
         self.crack_stats.set(
-            f"step {step}   max phi = {phi.max():.3f}   "
-            f"nodes above {iso:g}: {n_dam}   {os.path.basename(path)}")
+            f"step {step}   {head}   {os.path.basename(path)}{shape}"
+            + getattr(self, "_crack_mesh_note", ""))
+
+    def _cmap_changed(self):
+        """Remember the choice against the KIND of field it was made for."""
+        spec = CRACK_FIELDS.get(self.field_var.get(), CRACK_FIELDS["phi"])
+        if spec["signed"]:
+            self._cmap_div = self.cmap_var.get()
+        else:
+            self._cmap_seq = self.cmap_var.get()
+        self._redraw_crack_overlay()
+
+    def _deform_scale(self, disp):
+        """The magnification actually in force, 0.0 meaning undeformed."""
+        choice = self.deform_var.get()
+        if choice == "undeformed" or disp is None or self._tri is None:
+            return 0.0
+        if choice != "auto":
+            try:
+                return float(choice.lstrip("x"))
+            except ValueError:
+                return 0.0
+        umax = float(np.hypot(disp[:, 0], disp[:, 1]).max())
+        if umax <= 0.0:
+            return 0.0
+        diag = float(np.hypot(self._tri.x.max() - self._tri.x.min(),
+                              self._tri.y.max() - self._tri.y.min()))
+        return AUTO_DEFORM_FRACTION * diag / umax
+
+    def _deformed_xy(self, disp, scale):
+        """Node coordinates at x + scale*u, or the reference ones."""
+        if scale <= 0.0 or disp is None:
+            return self._tri.x, self._tri.y
+        return self._tri.x + scale * disp[:, 0], self._tri.y + scale * disp[:, 1]
+
+    def _deform_changed(self):
+        """Switch between the reference and the deformed shape.
+
+        Only goes back to the file when it has to: the displacement is read
+        alongside the field, so once it is in hand every other magnification
+        is a redraw. Turning deformation ON for the first time on a frame that
+        was loaded without it is the one case that needs a reload.
+        """
+        need = self.deform_var.get() != "undeformed"
+        have = self._crack_last is not None and self._crack_last[5] is not None
+        if need and not have:
+            self.draw_crack(target=self._crack_step if self._crack_step >= 0
+                            else None)
+        else:
+            self._redraw_crack_overlay()
+
+    def _field_changed(self):
+        """Switch the quantity being drawn.
+
+        This one DOES have to go back to the file -- a different field is a
+        different block of the snapshot, and it is not in memory. It reloads
+        the frame you are on rather than jumping to the newest, so changing
+        what you are looking at does not also change when you are looking at.
+        """
+        spec = CRACK_FIELDS.get(self.field_var.get(), CRACK_FIELDS["phi"])
+        self.cmap_combo.configure(values=DIVERGING if spec["signed"] else CMAPS)
+        self.cmap_var.set(self._cmap_div if spec["signed"] else self._cmap_seq)
+        self.iso_entry.configure(
+            state="normal" if self.field_var.get() == "phi" else "disabled")
+        # A different field means a different range, so the saved view is kept
+        # but the colour scale is rebuilt from scratch.
+        self.draw_crack(target=self._crack_step if self._crack_step >= 0
+                        else None)
+
+    def _redraw_crack_overlay(self):
+        """Re-render the frame already on screen with the overlay changed.
+
+        Deliberately NOT draw_crack(): that would go back to the disk for a
+        file whose contents are already in memory, and on the newest frame it
+        would also have to wait for the stability check. Switching an overlay
+        is a drawing decision, not a reason to re-read anything.
+        """
+        if self._crack_last is None:
+            self.draw_crack()
+            return
+        path, step, values, where, field, disp = self._crack_last
+        self._render_crack(path, step, values, where, field, disp)
 
     # Any 1D physical group that names a pre-existing flaw. Matched loosely so
     # it works across specimens without configuration: the STEP-built meshes
     # use lowercase "crack", the spec-built ones "Crack" or "NotchFaces".
     _NOTCH_RE = re.compile(r"crack|notch", re.IGNORECASE)
+
+    def _overlay_mesh(self) -> str:
+        """Which .msh the notch and mesh overlays should read.
+
+        The box in section 2 wins when it names a file that exists -- that is
+        the mesh you are about to RUN, and while setting a run up it is the
+        one you mean. Otherwise fall back to the copy inside the output
+        folder, which is the mesh the results on screen were actually
+        computed on. Between them, looking at any run works without first
+        remembering to point at its geometry.
+        """
+        path = self.vars["mesh_path"].get().strip()
+        if path:
+            full = (path if os.path.isabs(path)
+                    else os.path.join(PROJECT_DIR, path))
+            if os.path.isfile(full):
+                return full
+        try:
+            f = self.get_form()
+        except ValueError:
+            return ""
+        beside = run_mesh_for(f)
+        if not beside:
+            return ""
+        full = (beside if os.path.isabs(beside)
+                else os.path.join(PROJECT_DIR, beside))
+        return full if os.path.isfile(full) else ""
 
     def _notch_segments(self):
         """Line segments of the notch, from the mesh the solver was given.
@@ -3995,19 +4700,24 @@ class App:
         and is cached on the file's mtime, so this is free after the first call
         -- and the Mesh tab has usually paid for it already.
         """
-        path = self.vars["mesh_path"].get().strip()
-        if not path:
+        full = self._overlay_mesh()
+        if not full:
             return []
-        full = path if os.path.isabs(path) else os.path.join(PROJECT_DIR, path)
-        # Never make the crack render wait on gmsh.  The Mesh tab/background
-        # loader populates this cache; until then the field is still useful and
-        # the notch overlay appears on the next refresh.
-        hit = _MESH_CACHE.get(full)
         try:
             current_mtime = os.path.getmtime(full)
         except OSError:
-            return []
+            return []                        # no mesh to read: nothing to draw
+        hit = _MESH_CACHE.get(full)
         if not hit or hit[0] != current_mtime:
+            # NOT a silent give-up, which is what this was: the render must not
+            # block on gmsh, but returning [] and waiting for "the next
+            # refresh" meant the notch appeared only if you had already opened
+            # the Mesh tab and pressed Draw mesh. Nothing else ever filled this
+            # cache, so on a fresh session the overlay simply never worked.
+            #
+            # Ask for the mesh in the background instead and redraw when it
+            # lands -- the same worker and queue every other read here uses.
+            self._request_notch_mesh(full, current_mtime)
             return []
         m = hit[1]
         segs = []
@@ -4018,16 +4728,130 @@ class App:
                 segs.extend(s)
         return segs
 
+    def _request_notch_mesh(self, full, mtime):
+        """Read the mesh off the Tk thread, once, then re-render.
+
+        Keyed on (path, mtime) so a mesh that fails to read is not retried on
+        every frame -- _render_crack calls this, and _notch_loaded triggers a
+        render, so without that guard a broken mesh would spin between the
+        two forever. Editing the mesh changes the mtime and it tries again.
+        """
+        key = (full, mtime)
+        if key in self._notch_tried:
+            return
+        self._notch_tried.add(key)
+        threading.Thread(target=self._notch_worker, args=(full,),
+                         daemon=True).start()
+
+    def _notch_worker(self, full):
+        try:
+            with self._io_lock:              # gmsh, one caller at a time
+                read_mesh_for_plot(full)     # its only job is to fill the cache
+        except Exception:
+            pass
+        self.io_q.put((self._notch_loaded, ()))
+
+    def _notch_loaded(self):
+        if self.show_notch.get() and self._crack_last is not None:
+            self._redraw_crack_overlay()
+
+    def _crack_polys(self, scale, dx, dy):
+        """Element outlines on the current geometry.
+
+        The undeformed set is cached from the parse; the deformed one is
+        rebuilt from the node indices, which is why read_vtk_geometry keeps
+        them. One fancy-index over an (nelem, 4) array -- cheap enough to do
+        per frame, and it cannot drift from the nodes it was built from.
+        """
+        if scale <= 0.0 or self._tri_cells is None:
+            return self._tri_polys
+        return np.stack([dx, dy], axis=1)[self._tri_cells]
+
+    def _draw_crack_mesh(self, box=None):
+        """The mesh over the contour: nodes, element outlines, or both.
+
+        `box` is (x0, x1, y0, y1) to cull against -- the view that is about to
+        be shown. None means the whole specimen.
+
+        Culled to the visible axes, because that is the only view in which the
+        question makes sense. Zoomed out, 340k elements are sub-pixel and the
+        overlay is a grey wash over the field it is supposed to be explaining;
+        zoomed into the tip, the same code draws a few hundred and answers
+        "is l0 resolved here" at a glance.
+        """
+        mode = self.crack_overlay.get()
+        if mode == "none" or self._tri is None:
+            self._crack_mesh_note = ""
+            return
+        want_nodes = "nodes" in mode
+        want_elems = "element" in mode
+        # Whatever geometry the field was just drawn on -- the overlay has to
+        # sit on the SAME nodes, or a deformed contour would be wearing an
+        # undeformed wireframe. Hoisted above the box branch below, which
+        # falls back to these coordinates for its extent.
+        scale = getattr(self, "_crack_scale", 0.0)
+        disp = self._crack_last[5] if self._crack_last else None
+        dx, dy = self._deformed_xy(disp, scale)
+
+        if box is not None:
+            x0, x1, y0, y1 = box
+            # A small margin, because set_aspect("equal", adjustable="datalim")
+            # is allowed to widen the limits after they are set -- matplotlib
+            # says so out loud ("Ignoring fixed x limits to fulfil fixed data
+            # aspect"). Culling against the REQUESTED box would then leave a
+            # thin band at the edge of the view with no overlay on it.
+            mx, my = 0.05 * (x1 - x0), 0.05 * (y1 - y0)
+            x0, x1, y0, y1 = x0 - mx, x1 + mx, y0 - my, y1 + my
+        else:
+            x0, x1 = float(dx.min()), float(dx.max())
+            y0, y1 = float(dy.min()), float(dy.max())
+        notes = []
+
+        # White with a dark edge rather than a single flat colour: a
+        # sequential map runs from near-black to near-white, so ANY one colour
+        # disappears at one end of it. The pairing survives both ends.
+        if want_elems and self._tri_polys is not None:
+            polys = self._crack_polys(scale, dx, dy)
+            cent = polys.mean(axis=1)
+            vis = ((cent[:, 0] >= x0) & (cent[:, 0] <= x1) &
+                   (cent[:, 1] >= y0) & (cent[:, 1] <= y1))
+            n_vis = int(vis.sum())
+            if n_vis == 0:
+                pass
+            elif n_vis > CRACK_ELEM_LIMIT:
+                notes.append(f"{n_vis:,} elements in view - zoom in to draw them")
+            else:
+                self.cax.add_collection(PolyCollection(
+                    polys[vis], facecolors="none", edgecolors="#ffffff",
+                    linewidths=0.4, alpha=0.45, zorder=3))
+                notes.append(f"{n_vis:,} elements")
+
+        if want_nodes:
+            xs, ys = dx, dy
+            vis = (xs >= x0) & (xs <= x1) & (ys >= y0) & (ys <= y1)
+            n_vis = int(vis.sum())
+            if n_vis == 0:
+                pass
+            elif n_vis > CRACK_NODE_LIMIT:
+                notes.append(f"{n_vis:,} nodes in view - zoom in to draw them")
+            else:
+                # Size backs off as they crowd together, so a refined patch
+                # reads as a mesh instead of as one solid blob of markers.
+                ms = 3.4 if n_vis < 1500 else (2.4 if n_vis < 5000 else 1.6)
+                self.cax.plot(xs[vis], ys[vis], "o", ms=ms, mfc="#ffffff",
+                              mec="#101010", mew=0.35, linestyle="none",
+                              alpha=0.9, zorder=5)
+                notes.append(f"{n_vis:,} nodes")
+        self._crack_mesh_note = ("   mesh: " + ", ".join(notes)) if notes else ""
+
     def fit_crack(self):
-        # Force a fitted redraw of the CURRENT historical state.  Resetting the
-        # view must not unexpectedly jump an intentionally paused browser back
-        # to the newest snapshot.
-        snapshots = vtk_snapshots(self._vtk_dir())
-        steps = [item[0] for item in snapshots]
-        index = steps.index(self._crack_step) if self._crack_step in steps else None
-        self._crack_step = -1        # makes _render_crack discard saved limits
-        self._crack_path = ""
-        self.draw_crack(force=True, target_index=index)
+        """Refit the axes to the specimen, WITHOUT jumping to the newest
+        frame -- fitting the view and choosing which snapshot to look at are
+        two different intentions."""
+        here = self._crack_step
+        self._crack_step = -1        # forget the saved view
+        self.draw_crack(force=True,
+                        target=None if self.follow_crack.get() else here)
 
     def _maybe_follow_crack(self):
         """Redraw only when a NEW snapshot exists and the tab is visible.
@@ -4251,6 +5075,24 @@ class App:
             if hot:
                 i += 1
 
+        # Pre-crack ([[initial_history]]): dashed red over the mesh, so a
+        # wrong coordinate is obvious before the run, not after it.
+        if self.vars.get("ih_on") is not None and self._v("ih_on") in ("1", "True"):
+            try:
+                pts = parse_crack_points(self._v("ih_points"))
+            except ValueError:
+                pts = []
+            if len(pts) >= 2:
+                self.max_.plot([p[0] for p in pts], [p[1] for p in pts], "--",
+                               color="#ff3b30", lw=2.4, zorder=6,
+                               label="initial crack (H0)")
+            grp = self._v("ih_group").strip()
+            if grp and grp in m["edges"]:
+                self.max_.add_collection(LineCollection(
+                    m["edges"][grp], colors="#ff3b30", linewidths=2.4,
+                    linestyles="dashed", zorder=6,
+                    label=None if len(pts) >= 2 else "initial crack (H0)"))
+
         self.mesh_bbox = m["bbox"]
         if keep:
             self.max_.set_xlim(*keep[0])
@@ -4286,6 +5128,7 @@ class App:
             elif key in f:
                 v.set(f[key] if isinstance(v, tk.BooleanVar) else str(f[key]))
         self.bctable.set(f.get("bcs", []))
+        self._ih_extra = list(f.get("ih_extra") or [])
         # An imported config can switch step_mode or mesh source, so the field
         # set has to follow it.
         self._apply_visibility()
@@ -4301,19 +5144,28 @@ class App:
         # Numeric fields arrive as strings from Entry widgets.
         for key in ("E", "nu", "Gc", "l0", "k", "gamma_tol", "tol_rel",
                     "tol_abs", "du", "du_coarse", "u_switch", "du_fine",
-                    "u_switch2", "du_final"):
+                    "u_switch2", "du_final", "ih_B", "ih_half_width"):
             try:
                 f[key] = float(str(f[key]).strip())
             except ValueError:
                 raise ValueError(f"'{key}' is not a number: {f[key]!r}")
         for key in ("ngaus", "max_staggered", "max_iter", "N_steps",
-                    "max_subdivs", "vtk_every", "profile_every"):
+                    "max_subdivs", "vtk_every", "profile_every",
+                    "phi_active_set_max_iter"):
             try:
                 f[key] = int(float(str(f[key]).strip()))
             except ValueError:
                 raise ValueError(f"'{key}' is not an integer: {f[key]!r}")
         f["bcs"] = self.bctable.get()
+        f["ih_on"] = bool(f.get("ih_on"))
+        f["ih_extra"] = list(getattr(self, "_ih_extra", []))
         return f
+
+    def _ih_changed(self):
+        """Pre-crack edited: update the visible fields and the overlay."""
+        self._apply_visibility()
+        if getattr(self, "mesh_bbox", None) is not None:
+            self.draw_mesh(preserve_view=True)
 
     # -- actions --------------------------------------------------------
     def _pick_exe(self):
@@ -4381,7 +5233,7 @@ class App:
         else:
             self.mesh_info.set("")
         self.bctable.refresh_names()
-        self._schedule_validation()
+        self._refresh_warnings()
 
     def import_config(self, path: str = ""):
         if not path:
@@ -4392,7 +5244,6 @@ class App:
                 return
         try:
             self.set_form(config_to_form(_toml_load(path)))
-            self._remember_config(path)
             self._append_log(f"[gui] imported {os.path.basename(path)}\n")
             self._refresh_warnings()
         except Exception as exc:
@@ -4410,175 +5261,48 @@ class App:
             filetypes=[("TOML config", "*.toml")])
         if p:
             open(p, "w", encoding="utf-8").write(text)
-            self._remember_config(p)
             self._append_log(f"[gui] saved {p}\n")
 
-    def _schedule_validation(self):
-        """Coalesce edits so validation runs once after the user pauses typing."""
-        if self._validation_job is not None:
-            try:
-                self.root.after_cancel(self._validation_job)
-            except tk.TclError:
-                pass
-        self._validation_job = self.root.after(250, self._refresh_warnings)
-
-    def _raw_field_errors(self):
-        """Find conversion errors without aborting on the first bad field."""
-        errors = {}
-        float_keys = ("E", "nu", "Gc", "l0", "k", "gamma_tol", "tol_rel",
-                      "tol_abs", "du", "du_coarse", "u_switch", "du_fine",
-                      "u_switch2", "du_final")
-        int_keys = ("ngaus", "max_staggered", "max_iter", "N_steps",
-                    "max_subdivs", "vtk_every", "profile_every")
-        for key in float_keys:
-            try:
-                float(self.vars[key].get().strip())
-            except (KeyError, ValueError):
-                errors[key] = "Enter a number"
-        for key in int_keys:
-            try:
-                value = float(self.vars[key].get().strip())
-                if not value.is_integer():
-                    raise ValueError
-            except (KeyError, ValueError):
-                errors[key] = "Enter a whole number"
-        return errors
-
-    def _logical_field_errors(self, f):
-        """Map blocking configuration rules back to the controls that own them."""
-        errors = {}
-        if not f["base_name"].strip():
-            errors["base_name"] = "Required"
-        if f["mesh_source"] == "file":
-            path = f["mesh_path"].strip()
-            full = path if os.path.isabs(path) else os.path.join(PROJECT_DIR, path)
-            if not path:
-                errors["mesh_path"] = "Choose a mesh file"
-            elif not os.path.isfile(full):
-                errors["mesh_path"] = "File not found"
-        for key in ("E", "Gc", "l0"):
-            if float(f[key]) <= 0:
-                errors[key] = "Must be positive"
-        if not 0.0 < float(f["nu"]) < 0.5:
-            errors["nu"] = "Use a value from 0 to 0.5"
-        if f["step_mode"] == "three_stage":
-            if float(f["du_final"]) <= 0:
-                errors["du_final"] = "Must be positive"
-            if float(f["u_switch2"]) <= float(f["u_switch"]):
-                errors["u_switch2"] = "Must exceed the first switch"
-        if (f["step_mode"] in ("two_stage", "three_stage") and
-                float(f["du_fine"]) > float(f["du_coarse"])):
-            errors["du_fine"] = "Must not exceed coarse step"
-        return errors
-
-    def _set_inline_errors(self, errors):
-        """Apply red outlines and short explanations beside invalid controls."""
-        for key, widget in self._field_widgets.items():
-            normal = "TCombobox" if isinstance(widget, ttk.Combobox) else "TEntry"
-            invalid = "Invalid.TCombobox" if normal == "TCombobox" else "Invalid.TEntry"
-            try:
-                widget.configure(style=invalid if key in errors else normal)
-            except tk.TclError:
-                pass
-            feedback = self._field_feedback.get(key)
-            if feedback:
-                label, normal_text = feedback
-                label.configure(text=errors.get(key, normal_text),
-                                foreground=T["err"] if key in errors else T["muted"])
-
-        # Do not leave the offending control hidden inside a collapsed group.
-        for key in errors:
-            title = self._field_sections.get(key)
-            if title:
-                self._set_section_expanded(title, True)
-
-    def _update_run_summary(self, f=None):
-        if f is None:
-            self.summary_var.set("Complete the highlighted fields to calculate the run.")
-            self._refresh_section_summaries()
-            return
-        mesh = (os.path.basename(f["mesh_path"]) if f["mesh_source"] == "file"
-                else "built-in mesh")
-        groups = (f" · {len(self.mesh_groups)} physical groups"
-                  if self.mesh_groups else "")
-        model = (f"{next((k for k, v in NTYPES.items() if v == f['ntype']), f['ntype'])}"
-                 f" · {f['energy_split']} split · {f['scheme']}")
-
-        loads = []
-        for b in f["bcs"]:
-            vals = []
-            if b.get("kind") == "displacement":
-                if b.get("fix_x") and float(b.get("vx", 0)):
-                    vals.append(f"ux {float(b['vx']):g} mm")
-                if b.get("fix_y") and float(b.get("vy", 0)):
-                    vals.append(f"uy {float(b['vy']):g} mm")
-            elif float(b.get("vx", 0)) or float(b.get("vy", 0)):
-                vals.append(f"{b['kind']} ({float(b['vx']):g}, {float(b['vy']):g})")
-            if vals and b.get("group"):
-                loads.append(f"{b['group']}: {', '.join(vals)}")
-        load_text = loads[0] + (f" · +{len(loads)-1} more" if len(loads) > 1 else "") \
-            if loads else "no non-zero load"
-
-        plan = planned_steps(f)
-        plan_text = f"{plan[0]:,} planned steps" if plan else "step count unknown"
-        out = os.path.join(f["output_dir"] or ".", f["base_name"] or "run")
-        self.summary_var.set(
-            f"{mesh}{groups} · {model} · {plan_text}\n"
-            f"{load_text} · VTK every {f['vtk_every']} · {out}")
-        self._refresh_section_summaries()
-
     def _refresh_warnings(self):
-        self._validation_job = None
         self.warnbox.delete("1.0", "end")
-        raw_errors = self._raw_field_errors()
-        if raw_errors:
-            self._set_inline_errors(raw_errors)
-            self._update_run_summary()
-            self.validation_state.set(
-                f"{len(raw_errors)} field{'s' if len(raw_errors) != 1 else ''} need attention")
-            self.validation_label.configure(style="Warning.TLabel")
-            self.warnbox.insert("end", "\n".join(
-                f"{key}: {message}" for key, message in raw_errors.items()))
-            if not self.warnbox.winfo_manager():
-                self.warnbox.pack(fill="x", padx=px(6), pady=(px(4), px(8)))
-            self.progress_txt.set("")
-            return
         try:
             f = self.get_form()
         except ValueError as exc:
             self.warnbox.insert("end", str(exc))
-            self.validation_state.set("Configuration needs attention")
-            self.validation_label.configure(style="Warning.TLabel")
-            if not self.warnbox.winfo_manager():
-                self.warnbox.pack(fill="x", padx=px(6), pady=(px(4), px(8)))
+            for key in self._field_section:
+                if f"'{key}'" in str(exc):
+                    self._reveal_field(key)
+            self._refresh_section_summaries()
             return
-        field_errors = self._logical_field_errors(f)
-        self._set_inline_errors(field_errors)
-        self._update_run_summary(f)
         msgs = ([("PROBLEM: " + m) for m in validate_form(f)]
                 + [("PROBLEM: " + m)
                    for m in check_group_dims(f["bcs"], self.mesh_groups)]
                 + warn_form(f))
-        if msgs:
-            self.validation_state.set(
-                f"{len(msgs)} configuration note{'s' if len(msgs) != 1 else ''}")
-            self.validation_label.configure(style="Warning.TLabel")
-            self.warnbox.insert("end", "\n\n".join(msgs))
-            if not self.warnbox.winfo_manager():
-                self.warnbox.pack(fill="x", padx=px(6), pady=(px(4), px(8)))
-        else:
-            self.validation_state.set("Configuration ready")
-            self.validation_label.configure(style="Good.TLabel")
-            if self.warnbox.winfo_manager():
-                self.warnbox.pack_forget()
+        self.warnbox.insert("end", "\n\n".join(msgs) if msgs else "")
+        # A complaint about a field you cannot see is a dead end, so anything
+        # named in a PROBLEM opens the section holding it. Only problems --
+        # warn_form's notes are advice, not a reason to rearrange the panel
+        # under someone's hands.
+        problems = " ".join(msgs[:len(msgs) - len(warn_form(f))])
+        for key in self._field_section:
+            if key in problems:
+                self._reveal_field(key)
+        self._refresh_section_summaries()
         self._show_plan(f)
 
     def _update_progress(self):
-        """Progress and a stage-aware ETA based on actual displacement.
+        """Progress bar + a stage-aware ETA.
 
-        Accepted step numbers are not progress: adaptive half-stepping can add
-        accepted increments.  Reading the latest already-cached CSV point lets
-        the bar continue to represent the requested load schedule accurately.
+        ACCEPTED STEP NUMBERS ARE NOT PROGRESS. Two separate things break that
+        assumption: adaptive half-stepping inserts steps that were never
+        planned, and a staged schedule can fail to reach a later stage at all.
+        So the bar is driven by the DISPLACEMENT actually reached, read from
+        the CSV the solver is already flushing, and only the labels talk about
+        steps.
+
+        The ETA is summed per remaining stage, each at its own measured rate
+        (`_stage_times`), because a coarse step and a step during crack growth
+        cost very different amounts and one pooled average predicts neither.
         """
         if self._last_step <= 0:
             return
@@ -4590,43 +5314,106 @@ class App:
             self._last_rate = rate
 
         staged = load_stages(self._run_form or {})
-        u_now = None
+        u_now = du_actual = None
         if staged:
             u, _F, _phi, _conv, _labels = read_curve(self.csv_path)
             if u:
                 u_now = abs(u[-1])
+            if len(u) >= 2:
+                step = abs(u[-1] - u[-2])
+                if step > 0.0:
+                    du_actual = step
 
+        stuck = ""
         if staged and u_now is not None:
             stages, _u_ref = staged
             remaining = remaining_stage_steps(stages, u_now)
-            nominal_left = sum(remaining)
-            nominal_done = max(0, total - nominal_left)
-            frac = min(nominal_done / total, 1.0) if total else 0.0
-            self.progress["value"] = int(1000 * frac)
+            # Steps already behind us, measured in the schedule's own terms.
+            # Taken BEFORE the correction below, because what is done is done
+            # -- only the estimate of what is left can change.
+            done_nominal = max(0, total - sum(remaining))
             active = next((i for i, n in enumerate(remaining) if n),
                           len(stages) - 1)
-            bits = [f"step {done:,}", f"{100.0 * frac:.1f}%",
-                    f"stage {active + 1}/{len(stages)} {stages[active][0]}"]
-        else:
-            remaining = None
-            frac = min(done / total, 1.0) if total else 0.0
-            self.progress["value"] = int(1000 * frac)
-            bits = [f"step {done:,}" + (f" / {total:,}" if total else "")]
 
+            # THE INCREMENT THE SOLVER IS REALLY TAKING, not the one the
+            # config asked for.
+            #
+            # main.cpp used to clamp lf_inc DOWN at a stage boundary and never
+            # up, so a stage COARSER than the one before it was reachable only
+            # through the adaptive re-growth -- two consecutive CONVERGED
+            # steps -- which during crack growth never happens. One measured
+            # run planned 600 steps for its final stage and executed 6,000.
+            #
+            # A boundary now SETS the increment in both directions, so this
+            # should no longer fire. It is kept because it is a few lines and
+            # still catches the case that matters: an exe built before that
+            # change. Nothing else here can tell you which solver you just
+            # launched.
+            nom = stages[active][3]
+            if du_actual and du_actual < 0.8 * nom:
+                end = stages[active][2]
+                width = max(0.0, end - u_now)
+                remaining[active] = max(0, math.ceil(width / du_actual - 1e-7))
+                stuck = (f"increment {du_actual:g}, schedule says {nom:g}"
+                         f" - stage not entered")
+
+            nominal_left = sum(remaining)
+            # Against a REVISED total, not the original plan. Once the
+            # correction above has decided the run needs 5,600 more steps
+            # where the plan allowed 560, dividing by the plan gives a
+            # fraction below zero and a bar that reads 0% two thirds of the
+            # way through the loading. The denominator has to grow with the
+            # estimate.
+            revised = done_nominal + nominal_left
+            frac = min(done_nominal / revised, 1.0) if revised else 0.0
+            self.progress["value"] = int(1000 * frac)
+            # "step 49" on its own answers half the question. The total is
+            # the steps ALREADY TAKEN plus the ones the schedule still needs,
+            # rather than the figure planned before the run started: adaptive
+            # subdivisions add steps, and a stage the solver failed to enter
+            # adds a great many, so a fixed denominator goes stale early and
+            # then quietly lies for the rest of the run. This one tracks.
+            total_est = done + nominal_left
+            bits = [f"step {done:,} / {total_est:,}",
+                    f"{100.0 * frac:.1f}%",
+                    f"stage {active + 1}/{len(stages)} {stages[active][0]}"]
+            if rate:
+                bits.append(f"{rate:.2f} s/step")
+            if nominal_left and rate:
+                eta = 0.0
+                for i, count in enumerate(remaining):
+                    if not count:
+                        continue
+                    samples = self._stage_times[i]
+                    stage_rate = (sum(samples) / len(samples) if samples
+                                  else self._last_stage_rates[i] or rate)
+                    eta += count * stage_rate
+                bits.append(f"ETA ~{fmt_duration(eta)}")
+            if stuck:
+                bits.append(stuck)
+            self.progress_txt.set("   ".join(bits))
+            return
+
+        # Unstaged, or the CSV has not produced a point yet: fall back to
+        # counting steps against the plan. Passing the plan is REPORTED rather
+        # than fallen off the end of -- the old `done < total` guard made the
+        # bar pin at 100% and the ETA vanish, which reads as finished.
+        over = bool(total) and done > total
+        frac = 1.0 if over else (min(done / total, 1.0) if total else 0.0)
+        self.progress["value"] = int(1000 * frac)
+        if not total:
+            bits = [f"step {done:,}"]
+        elif over:
+            bits = [f"step {done:,}   {done - total:,} past the planned "
+                    f"{total:,}"]
+        else:
+            bits = [f"step {done:,} / {total:,}"]
         if rate:
             bits.append(f"{rate:.2f} s/step")
-        if remaining is not None and nominal_left and rate:
-            eta = 0.0
-            for i, count in enumerate(remaining):
-                if not count:
-                    continue
-                samples = self._stage_times[i]
-                stage_rate = (sum(samples) / len(samples) if samples
-                              else self._last_stage_rates[i] or rate)
-                eta += count * stage_rate
-            bits.append(f"ETA ~{fmt_duration(eta)}")
-        elif total and rate and done < total:
-            bits.append(f"ETA ~{fmt_duration((total - done) * rate)}")
+        if over:
+            bits.append("ETA unknown - past the planned schedule")
+        elif total and rate:
+            bits.append(f"ETA {fmt_duration((total - done) * rate)}")
         self.progress_txt.set("   ".join(bits))
 
     def _record_step_timings(self, samples):
@@ -4670,13 +5457,9 @@ class App:
         total, n_c, n_f, u_ref = plan
         self.progress["value"] = 0
         mode = f.get("step_mode")
-        staged = load_stages(f)
-        if staged:
-            counts = [s[4] for s in staged[0]]
-            detail = "  (" + " + ".join(
-                f"{n:,} {stage[0]}" for n, stage in zip(counts, staged[0])) + ")"
-        else:
-            detail = "  (uniform)"
+        detail = (f"  ({n_c} coarse + {n_f:,} fine)" if mode == "two_stage"
+                  else f"  ({n_c} + {n_f:,} over 2 finer stages)"
+                  if mode == "three_stage" else "  (uniform)")
         rate = self._sec_per_step_hint(total)
         self.progress_txt.set(f"plan: {total:,} steps{detail}"
                               + (f"   ~{rate}" if rate else ""))
@@ -4710,13 +5493,6 @@ class App:
         coarse/fine boundary for the peak to fall on the wrong side of, so the
         u_switch line and the warning are both suppressed.
         """
-        for artist in self._curve_annotations:
-            try:
-                artist.remove()
-            except (ValueError, AttributeError):
-                pass
-        self._curve_annotations = []
-
         two_stage, u_sw, _ = self._schedule_info()
         i = peak_index(F)
 
@@ -4736,26 +5512,21 @@ class App:
             # while u_switch is a magnitude, so the guide line has to take the
             # sign of the curve or it lands off-screen on the wrong side.
             x_sw = math.copysign(u_sw, u[-1] if u[-1] else 1.0)
-            self._curve_annotations.append(
-                self.ax.axvline(x_sw, color=T["muted"], lw=1.0, ls="--", zorder=0))
-            self._curve_annotations.append(
-                self.ax.annotate("u_switch", xy=(x_sw, 0),
-                                 xycoords=("data", "axes fraction"),
-                                 xytext=(3, 4), textcoords="offset points",
-                                 color=T["muted"], fontsize=8))
+            self.ax.axvline(x_sw, color=T["muted"], lw=1.0, ls="--", zorder=0)
+            self.ax.annotate("u_switch", xy=(x_sw, 0), xycoords=("data", "axes fraction"),
+                             xytext=(3, 4), textcoords="offset points",
+                             color=T["muted"], fontsize=8)
 
         if i is None:
             return
         up, Fp = u[i], F[i]
         coarse = two_stage and u_sw > 0 and abs(up) < u_sw
         col = T["err"] if coarse else T["warn"]
-        peak_artist, = self.ax.plot([up], [Fp], marker="v", ms=9, color=col,
-                                    linestyle="none", zorder=4)
-        self._curve_annotations.append(peak_artist)
-        self._curve_annotations.append(
-            self.ax.annotate(f"peak {abs(Fp):.4g}\n@ u = {abs(up):.4g}",
-                             xy=(up, Fp), xytext=(6, -22),
-                             textcoords="offset points", fontsize=8, color=col))
+        self.ax.plot([up], [Fp], marker="v", ms=9, color=col,
+                     linestyle="none", zorder=4)
+        self.ax.annotate(f"peak {abs(Fp):.4g}\n@ u = {abs(up):.4g}",
+                         xy=(up, Fp), xytext=(6, -22),
+                         textcoords="offset points", fontsize=8, color=col)
 
         # Report once per run, not once per redraw (twice a second).
         if self._peak_reported:
@@ -4821,9 +5592,9 @@ class App:
         self.proc_kind = kind
         self._on_success = on_success
         self.start_time = time.time()
+        self._last_elapsed = -1
+        self.readout.set("")
         self._set_state(f"{label}...", "busy")
-        self.elapsed_txt.set("0s")
-        self.curve_status.set("")
         for b in (self.btn_run, self.btn_check, self.btn_gen):
             b.configure(state="disabled")
         self.btn_stop.configure(state="normal")
@@ -4839,6 +5610,8 @@ class App:
         except ValueError as exc:
             messagebox.showerror("Bad value", str(exc))
             return
+        # Blocking here on purpose: validation below needs the group
+        # dimensions before it can decide whether this run is safe to start.
         self._scan_mesh(blocking=True)
         self._refresh_warnings()
 
@@ -4866,7 +5639,6 @@ class App:
         # and the check below would delete a live run's CSV out from under it.
         # Checked BEFORE anything is written or removed.
         self.csv_path = os.path.join(PROJECT_DIR, csv_path_for(f))
-        reset_curve_cache(self.csv_path)
         if not check_only and os.path.isfile(self.csv_path):
             age = time.time() - os.path.getmtime(self.csv_path)
             if age < LIVE_RUN_SECONDS:
@@ -4884,16 +5656,24 @@ class App:
         open(cfg_path, "w", encoding="utf-8").write(form_to_toml(f))
 
         self.last_rows = -1
+        # The incremental CSV reader keys on the path, and this run is about
+        # to overwrite that path with a different curve.
+        reset_curve_cache(self.csv_path)
+        reset_stagger_cache(self._stagger_path())
+        self._energy_rows = -1
+        self._stage_times = [[], [], []]
+        self._last_stage_rates = [0.0, 0.0, 0.0]
+        self._run_form = None if check_only else f
         # A new run may use a different mesh, so the cached triangulation and
         # the last-seen step must not carry over -- otherwise phi from the new
         # run gets drawn on the old geometry, or silently rejected for having
         # the wrong length.
         self._tri = None
         self._tri_npoin = 0
+        self._tri_polys = None
+        self._tri_cells = None
+        self._crack_last = None
         self._crack_step = -1
-        self._crack_path = ""
-        self._crack_snapshots = []
-        self._sync_crack_navigator([])
         self._vtk_sizes.clear()
 
         # Progress: a mesh-only check has no load steps, so leave the bar blank
@@ -4901,8 +5681,6 @@ class App:
         plan = planned_steps(f)
         self._plan_total = 0 if check_only else (plan[0] if plan else 0)
         self._step_times = []
-        self._stage_times = [[], [], []]
-        self._run_form = None if check_only else f
         self._last_step = 0
         self._peak_reported = False
         self.progress["value"] = 0
@@ -4911,17 +5689,18 @@ class App:
             else (f"0 / {self._plan_total:,} steps" if self._plan_total
                   else "running (step count unknown)"))
         if not check_only and os.path.isfile(self.csv_path):
-            # A leftover CSV would be drawn instantly and look like progress.
-            try:
-                os.remove(self.csv_path)
-            except OSError:
-                pass
+            # A leftover CSV would be drawn instantly and look like progress,
+            # so it has to go -- but MOVED, not deleted. See archive_curve.
+            kept = archive_curve(self.csv_path)
+            if kept:
+                self._append_log(
+                    f"[gui] {os.path.basename(self.csv_path)} already held a "
+                    f"finished run; kept as {os.path.basename(kept)}\n")
+        # A new run is a new curve, so any held view belongs to the old one.
         self.follow_curve.set(True)
         self.curve_hint.set("")
+        self._curve_drawn = False
         self.ax.clear(); style_axes(self.fig, self.ax); self.canvas.draw_idle()
-        self._curve_artists = None
-        self._curve_annotations = []
-        self.curve_status.set("")
 
         cmd = [exe, GENERATED] + extra
         self._append_log(f"\n$ {' '.join(cmd)}\n")
@@ -4948,12 +5727,21 @@ class App:
         self.proc_kind = "check" if check_only else "solve"
         self._on_success = None
         self.start_time = time.time()
+        self._last_elapsed = -1
+        self.readout.set("")
         self._set_state(f"{label}...", "busy")
-        self.elapsed_txt.set("0s")
         for b in (self.btn_run, self.btn_check, self.btn_gen):
             b.configure(state="disabled")
         self.btn_stop.configure(state="normal")
         threading.Thread(target=self._pump, args=(self.proc,), daemon=True).start()
+
+    def _stop_worker(self, proc):
+        signal_process_tree(proc, hard=False)
+        try:
+            proc.wait(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            self.log_q.put("[gui] graceful stop timed out; forcing process tree shutdown\n")
+            signal_process_tree(proc, hard=True)
 
     def _pump(self, proc):
         for line in proc.stdout:
@@ -4972,31 +5760,23 @@ class App:
         if self.proc is None:
             return
         if messagebox.askyesno("Stop", "Terminate the running solver?"):
+            # Off the UI thread: taskkill /T walks the process tree and can
+            # take a second or two, and freezing the window while stopping a
+            # run is precisely the wrong moment to freeze it.
             proc = self.proc
             self._set_state("stopping...", "busy")
             self.btn_stop.configure(state="disabled")
             threading.Thread(target=self._stop_worker, args=(proc,),
                              daemon=True).start()
 
-    def _stop_worker(self, proc):
-        signal_process_tree(proc, hard=False)
-        try:
-            proc.wait(timeout=3.0)
-        except subprocess.TimeoutExpired:
-            self.log_q.put("[gui] graceful stop timed out; forcing process tree shutdown\n")
-            signal_process_tree(proc, hard=True)
-
     # -- periodic -------------------------------------------------------
     @staticmethod
     def _tag_for(text):
         low = text.lower()
         return ("err" if ("error" in low or "diverged" in low
-                          or "non-converged" in low or "failed" in low
-                          or "fatal" in low)
+                          or "non-converged" in low)
                 else "warn" if ("warning" in low or low.startswith("[bc]"))
-                else "conv" if ("converg" in low or "residual" in low
-                                 or "iteration" in low or "stagger" in low)
-                else "normal")
+                else "")
 
     def _append_log(self, text):
         self._append_chunks([(self._tag_for(text), text)])
@@ -5011,17 +5791,11 @@ class App:
         """
         if not chunks:
             return
-        for _tag, text in chunks:
-            self._log_history.append(text)
-            self._log_history_chars += len(text)
-        while (self._log_history_chars > LOG_HISTORY_CHARS and
-               len(self._log_history) > 1):
-            self._log_history_chars -= len(self._log_history.pop(0))
         # Only follow the tail if the view is ALREADY at the bottom. Otherwise
         # scrolling back to read something gets yanked away every 60 ms, which
         # a faster refresh would make unbearable.
         try:
-            at_bottom = self.follow_log.get() and self.log.yview()[1] > 0.999
+            at_bottom = self.log.yview()[1] > 0.999
         except Exception:
             at_bottom = True
 
@@ -5039,81 +5813,10 @@ class App:
         if at_bottom:
             self.log.see("end")
 
-    def _follow_log_changed(self):
-        if self.follow_log.get():
-            self.log.see("end")
-
-    def _apply_log_filter(self):
-        wanted = {
-            "Normal": "normal", "Warnings": "warn",
-            "Convergence": "conv", "Errors": "err",
-        }.get(self.log_filter_var.get())
-        for tag in ("normal", "warn", "conv", "err"):
-            try:
-                self.log.tag_configure(tag, elide=bool(wanted and tag != wanted))
-            except tk.TclError:
-                pass
-        if self.follow_log.get():
-            self.log.see("end")
-
-    def _find_log(self, direction=1):
-        term = self.log_search_var.get()
-        if not term:
-            return
-        self.log.tag_remove("search_hit", "1.0", "end")
-        if direction >= 0:
-            start = self.log.index("insert +1c")
-            idx = self.log.search(term, start, stopindex="end", nocase=True)
-            if not idx:
-                idx = self.log.search(term, "1.0", stopindex=start, nocase=True)
-        else:
-            start = self.log.index("insert -1c")
-            idx = self.log.search(term, start, stopindex="1.0", nocase=True,
-                                  backwards=True)
-            if not idx:
-                idx = self.log.search(term, "end", stopindex=start, nocase=True,
-                                      backwards=True)
-        if not idx:
-            self.root.bell()
-            return
-        end = f"{idx}+{len(term)}c"
-        self.log.tag_add("search_hit", idx, end)
-        self.log.mark_set("insert", end)
-        self.log.see(idx)
-
-    def _copy_log(self):
-        try:
-            text = self.log.get("sel.first", "sel.last")
-        except tk.TclError:
-            text = self.log.get("1.0", "end-1c")
-        if not text:
-            return
-        self.root.clipboard_clear()
-        self.root.clipboard_append(text)
-
-    def _clear_log(self):
-        self.log.delete("1.0", "end")
-        self._log_history.clear()
-        self._log_history_chars = 0
-
-    def _save_log(self):
-        path = filedialog.asksaveasfilename(
-            parent=self.root, initialdir=PROJECT_DIR,
-            initialfile="solver_log.txt", defaultextension=".txt",
-            filetypes=[("Text log", "*.txt"), ("All files", "*.*")])
-        if not path:
-            return
-        try:
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write("".join(self._log_history))
-        except OSError as exc:
-            messagebox.showerror("Could not save log", str(exc))
-
     def _tick(self):
-        if self.proc is not None and self.start_time:
-            self.elapsed_txt.set(fmt_duration(time.time() - self.start_time))
-        # Background file readers return plain data here.  Every Tk and
-        # matplotlib operation remains on the UI thread.
+        # Results from the background readers land here as plain data. Bounded
+        # per tick so a burst cannot monopolise the frame, exactly like the
+        # log drain below.
         for _ in range(8):
             try:
                 callback, args = self.io_q.get_nowait()
@@ -5152,6 +5855,14 @@ class App:
             self._update_progress()
 
         if self.proc is not None:
+            # The clock. Once a SECOND, not once a tick: a StringVar write
+            # redraws the label, and at POLL_MS that is 40 redraws a second to
+            # show a number that changes once.
+            secs = int(time.time() - self.start_time)
+            if secs != self._last_elapsed:
+                self._last_elapsed = secs
+                self.elapsed.set(fmt_duration(secs))
+
             # Throttled independently of the log: see PLOT_MS.
             #
             # Suppressed entirely while a sash is being dragged. This refresh
@@ -5167,6 +5878,13 @@ class App:
                 self._last_plot = time.time()
                 self._refresh_plot()
                 self._maybe_follow_crack()
+                # Only while you are looking at it: this re-reads a file that
+                # grows by ten rows a step.
+                try:
+                    if self.nb.select() == str(self.energy_tab):
+                        self.draw_energy()
+                except tk.TclError:
+                    pass
             if finished:
                 code = self.proc.poll()
                 elapsed = time.time() - self.start_time
@@ -5181,7 +5899,7 @@ class App:
                     self._set_state("finished", "ok")
                 else:
                     self._set_state(f"FAILED (exit {code})", "fail")
-                self.elapsed_txt.set(fmt_duration(elapsed))
+                self.elapsed.set(fmt_duration(elapsed))
                 self._append_log(f"--- exit code {code} after {elapsed:.1f}s ---\n")
                 if code and code != 0:
                     note = explain_exit_code(code)
@@ -5189,18 +5907,26 @@ class App:
                         self._append_log(note)
                 if kind == "solve":
                     self._refresh_plot(force=True)
+                    self.draw_energy(force=True)
                 # Only run the follow-on when the tool actually succeeded --
                 # loading a mesh that failed to write would show a stale file.
                 if kind == "solve" and self._last_step:
                     # Final tally, and note whether it actually got there --
                     # a run that stops early because the crack finished is the
                     # normal outcome, not a failure.
-                    short = (self._plan_total and
-                             self._last_step < self._plan_total)
+                    plan = self._plan_total
+                    if plan and self._last_step < plan:
+                        note = f"  (stopped before the planned {plan:,})"
+                    elif plan and self._last_step > plan:
+                        # Worth saying out loud: it is the fingerprint of a
+                        # stage schedule the solver never actually entered.
+                        note = (f"  ({self._last_step - plan:,} more than the "
+                                f"planned {plan:,})")
+                    else:
+                        note = ""
                     self.progress_txt.set(
                         f"{self._last_step:,} steps in {fmt_duration(elapsed)}"
-                        + (f"  (stopped before the planned "
-                           f"{self._plan_total:,})" if short else ""))
+                        + note)
                 if code == 0 and hook is not None:
                     try:
                         hook()
@@ -5211,13 +5937,191 @@ class App:
 
         self.root.after(POLL_MS, self._tick)
 
+    # Which panels each view shows, in order.
+    ENERGY_PANELS = {"default": ("energy", "sweeps", "residual"),
+                     "stacked": ("energy", "sweeps", "residual"),
+                     "side by side": ("energy", "sweeps", "residual"),
+                     "energy": ("energy",), "sweeps": ("sweeps",),
+                     "residual": ("residual",)}
+    # Which panels carry an x label. A panel sitting directly above another
+    # one must not: they share the axis, and two sets of numbers a centimetre
+    # apart is exactly the clutter this is trying to remove.
+    ENERGY_XLABELS = {"default": (0, 2), "stacked": (2,),
+                      "side by side": (0, 1, 2)}
+
+    def _energy_axes(self, view):
+        """Build the axes for a layout, and only when the layout changes.
+
+        Rebuilding is cheap but not free, and draw_energy runs twice a second
+        during a solve -- so the figure is only torn down when you actually
+        pick a different arrangement.
+        """
+        if self._energy_built == view:
+            return self.eax
+        panels = self.ENERGY_PANELS.get(view, self.ENERGY_PANELS["stacked"])
+        self.efig.clf()
+        if len(panels) == 1:
+            axes = [self.efig.add_subplot(111)]
+        elif view == "default":
+            # Energy down the whole left column, the two diagnostics stacked
+            # on the right. gridspec rather than subplots() because one panel
+            # spans both rows.
+            gs = self.efig.add_gridspec(2, 2, width_ratios=(1.15, 1.0))
+            a_energy = self.efig.add_subplot(gs[:, 0])
+            a_sweeps = self.efig.add_subplot(gs[0, 1])
+            a_resid = self.efig.add_subplot(gs[1, 1], sharex=a_sweeps)
+            # The upper right panel sits on the lower one's axis, so its tick
+            # labels would just be a second copy of the numbers below it.
+            a_sweeps.tick_params(labelbottom=False)
+            # Linked to the pair as well, so a zoom on any panel moves all of
+            # them -- they are all the same run against the same x.
+            a_energy.sharex(a_sweeps)
+            axes = [a_energy, a_sweeps, a_resid]
+        elif view == "side by side":
+            axes = list(self.efig.subplots(1, len(panels), sharex=True))
+        else:
+            axes = list(self.efig.subplots(len(panels), 1, sharex=True))
+        for a in axes:
+            style_axes(self.efig, a)
+            # Four ticks, not the eight matplotlib picks for a full-height
+            # axes. In a third of a pane the default labels collide with each
+            # other and with the panel above, which is most of what "crowded"
+            # actually was.
+            a.yaxis.set_major_locator(MaxNLocator(nbins=4))
+        self.eax = axes
+        self._energy_built = view
+        # The figure geometry changed, so the cached tight_layout is stale.
+        self._laid_out.pop(id(self.efig), None)
+        return axes
+
+    def _panel_energy(self, a, x, d, ncol=3):
+        a.plot(x, d["E_elastic"], lw=1.4, color=T["line"], label="elastic")
+        a.plot(x, d["E_fracture"], lw=1.4, color=T["err"], label="fracture")
+        a.plot(x, d["E_total"], lw=1.0, color=T["muted"], ls="--",
+               label="total")
+        a.set_ylabel("energy")
+        # One row when the panel is wide, one column when it is narrow. A
+        # three-across legend is wider than a third-of-the-pane axes, so in
+        # the side-by-side layout it ran off the end and "total" was drawn
+        # outside the plot.
+        leg = a.legend(loc="upper left", fontsize=8, ncol=ncol, frameon=False,
+                       borderaxespad=0.2, handlelength=1.4, columnspacing=1.0)
+        for t in leg.get_texts():
+            t.set_color(T["fg"])
+
+    def _panel_sweeps(self, a, x, d, cap):
+        a.plot(x, d["sweeps"], lw=1.0, color=T["accent"])
+        if cap > 0:
+            # THE POINT OF THIS PANEL. A step sitting on the ceiling did not
+            # converge -- it ran out of sweeps. A whole run pinned to this
+            # line is the single clearest picture of a solve that is not
+            # working, and it was previously invisible.
+            a.axhline(cap, color=T["warn"], lw=1.0, ls="--")
+            a.annotate(f"max_staggered = {cap}", xy=(0.01, cap),
+                       xycoords=("axes fraction", "data"),
+                       xytext=(0, 3), textcoords="offset points",
+                       color=T["warn"], fontsize=8)
+            a.set_ylim(0, cap * 1.25)
+        a.set_ylabel("sweeps")
+
+    def _panel_residual(self, a, x, d):
+        a.plot(x, d["R_norm"], lw=1.0, color=T["line"])
+        if self.energy_logr.get() and any(v > 0 for v in d["R_norm"]):
+            a.set_yscale("log")
+        a.set_ylabel("residual")
+
+    def _stagger_path(self) -> str:
+        try:
+            f = self.get_form()
+        except ValueError:
+            return ""
+        p = stagger_path_for(f)
+        return os.path.join(PROJECT_DIR, p) if p else ""
+
+    def draw_energy(self, force=False):
+        """Energy split, sweeps per step, and the residual -- one x-axis.
+
+        Read inline rather than on the io worker: after the first pass this
+        parser is incremental and costs a fifth of a millisecond, exactly like
+        the force-displacement curve beside it, and putting a 0.2 ms read
+        through a queue buys nothing.
+        """
+        path = self._stagger_path()
+        d = read_stagger(path)
+        rows = len(d["lf"])
+        if rows == 0:
+            self.energy_stats.set(
+                "no energy log yet" if not path
+                else f"no rows in {os.path.basename(path)}")
+            return
+        if rows == self._energy_rows and not force:
+            return
+        self._energy_rows = rows
+
+        try:
+            f = self.get_form()
+        except ValueError:
+            f = dict(DEFAULTS)
+        u_ref = u_ref_of(f)
+        # Load factor is what the solver logs; displacement is what you think
+        # in. Convert when the schedule makes that possible, and say which one
+        # the axis is showing when it does not.
+        x = ([lf * u_ref for lf in d["lf"]] if u_ref > 0 else list(d["lf"]))
+        xlabel = "applied displacement" if u_ref > 0 else "load factor"
+
+        view = self.energy_view.get() or ENERGY_VIEWS[0]
+        panels = self.ENERGY_PANELS.get(view, self.ENERGY_PANELS["stacked"])
+        axes = self._energy_axes(view)
+        for a in axes:
+            a.clear()
+            style_axes(self.efig, a)
+            a.yaxis.set_major_locator(MaxNLocator(nbins=4))
+
+        cap = int(f.get("max_staggered", 0) or 0)
+        for i, (name, a) in enumerate(zip(panels, axes)):
+            if name == "energy":
+                self._panel_energy(
+                    a, x, d, ncol=1 if view == "side by side" else 3)
+            elif name == "sweeps":
+                self._panel_sweeps(a, x, d, cap)
+            else:
+                self._panel_residual(a, x, d)
+            if i in self.ENERGY_XLABELS.get(view, (0,)):
+                a.set_xlabel(xlabel)
+
+        self._layout(self.efig, f"energy|{view}|{xlabel}")
+        self.ecanvas.draw_idle()
+
+        at_cap = sum(1 for v in d["sweeps"] if cap and v >= cap)
+        note = (f"   {at_cap:,} of {rows:,} steps used every sweep "
+                f"({100.0 * at_cap / rows:.1f}%)" if cap else "")
+        # E_fracture / Gc is a LENGTH: Gc is the energy per unit of new crack
+        # surface, so dividing the energy actually dissipated by it gives the
+        # crack the model has paid for. Compare it with the one on the Crack
+        # tab -- if the model has bought far more crack than you can see, the
+        # damage band is wider than l0 intends and the mesh is too coarse for
+        # it.
+        gc = float(f.get("Gc", 0.0) or 0.0)
+        equiv = (f"   E_fracture / Gc = {d['E_fracture'][-1] / gc:.4g} mm of "
+                 f"crack" if gc > 0 else "")
+        self.energy_stats.set(
+            f"{rows:,} steps   E_elastic = {d['E_elastic'][-1]:.4g}   "
+            f"E_fracture = {d['E_fracture'][-1]:.4g}{equiv}{note}")
+
     def _refresh_plot(self, force=False):
         u, F, phi, conv, labels = read_curve(self.csv_path)
         if not u or (len(u) == self.last_rows and not force):
             return
-        hold_view = self._curve_artists is not None and not self.follow_curve.get()
-        held_limits = (self.ax.get_xlim(), self.ax.get_ylim())
+        # ax.clear() resets the limits to autoscale. That is what you want
+        # while the curve is still growing, and exactly what you do not want
+        # the moment you have zoomed in to look at something -- which is when
+        # this runs most often. Capture the view BEFORE clearing and put it
+        # back afterwards whenever following is off.
+        hold = self._curve_drawn and not self.follow_curve.get()
+        keep = (self.ax.get_xlim(), self.ax.get_ylim())
         self.last_rows = len(u)
+        self.ax.clear(); style_axes(self.fig, self.ax)
+        self.ax.plot(u, F, "-", lw=1.4, color=T["line"], zorder=1)
 
         ok = [(x, y) for x, y, c in zip(u, F, conv) if c != 0]
         bad = [(x, y) for x, y, c in zip(u, F, conv) if c == 0]
@@ -5231,58 +6135,42 @@ class App:
         # slow to draw at every refresh and unreadable -- the curve turns into
         # a solid bar. NON-CONVERGED STEPS ARE NEVER THINNED: they are the
         # reason to look at the plot at all, and dropping one would hide it.
-        stride = max(1, len(ok) // MAX_MARKERS) if ok else 1
-        shown = ok[::stride]
-        ok_label = "converged" + (f" (every {stride})" if stride > 1 else "")
-
-        # Keep the three line artists and only replace their data.  Clearing
-        # the axes rebuilt ticks, spines, legend and every marker twice a
-        # second; on long runs that was substantially more work than drawing
-        # the newly appended point.
-        if self._curve_artists is None or getattr(self, "_curve_labels", None) != labels:
-            self.ax.clear(); style_axes(self.fig, self.ax)
-            curve, = self.ax.plot([], [], "-", lw=1.4, color=T["line"], zorder=1)
-            good, = self.ax.plot([], [], "o", ms=3.5, mfc="none", mew=1.1,
-                                 mec=T["line"], linestyle="none", zorder=2)
-            failed, = self.ax.plot([], [], "o", ms=4.5, color=T["err"],
-                                   linestyle="none", zorder=3)
-            self._curve_artists = (curve, good, failed)
-            self._curve_labels = labels
-            self._curve_legend_sig = None
-            self._curve_annotations = []
-        curve, good, failed = self._curve_artists
-        curve.set_data(u, F)
-        good.set_data([p[0] for p in shown], [p[1] for p in shown])
-        failed.set_data([p[0] for p in bad], [p[1] for p in bad])
-        good.set_label(ok_label if ok else "_nolegend_")
-        failed.set_label("not converged" if bad else "_nolegend_")
-        self.ax.relim()
-        self.ax.autoscale_view()
-        if hold_view:
-            self.ax.set_xlim(*held_limits[0])
-            self.ax.set_ylim(*held_limits[1])
-
-        legend_sig = (bool(ok), bool(bad), stride)
-        if legend_sig != self._curve_legend_sig:
-            old_legend = self.ax.get_legend()
-            if old_legend is not None:
-                old_legend.remove()
-            if ok or bad:
-                leg = self.ax.legend(loc="best", fontsize=8,
-                                     facecolor=T["panel"], edgecolor=T["grid"])
-                for txt in leg.get_texts():
-                    txt.set_color(T["fg"])
-            self._curve_legend_sig = legend_sig
+        if ok:
+            stride = max(1, len(ok) // MAX_MARKERS)
+            shown = ok[::stride]
+            lbl = "converged" + (f" (every {stride})" if stride > 1 else "")
+            self.ax.plot([p[0] for p in shown], [p[1] for p in shown], "o",
+                         ms=3.5, mfc="none", mew=1.1, mec=T["line"],
+                         linestyle="none", label=lbl, zorder=2)
+        if bad:
+            self.ax.plot([b[0] for b in bad], [b[1] for b in bad], "o", ms=4.5,
+                         color=T["err"], linestyle="none",
+                         label="not converged", zorder=3)
+        if ok or bad:
+            leg = self.ax.legend(loc="best", fontsize=8,
+                                 facecolor=T["panel"], edgecolor=T["grid"])
+            for txt in leg.get_texts():
+                txt.set_color(T["fg"])
         self._annotate_peak(u, F)
         self.ax.set_xlabel(labels[0]); self.ax.set_ylabel(labels[1])
+        # After the annotations, not before: _annotate_peak draws the u_switch
+        # guide with axvline, which is in DATA coordinates and widens the
+        # x range to include it.
+        if hold:
+            self.ax.set_xlim(*keep[0])
+            self.ax.set_ylim(*keep[1])
+        self._curve_drawn = True
         # The axis labels come from the CSV header (applied_uy vs applied_ux),
         # so they are part of the layout key.
         self._layout(self.fig, f"{labels[0]}|{labels[1]}")
         self.canvas.draw_idle()
 
         peak = max((abs(x) for x in F), default=0.0)
-        self.curve_status.set(
-            f"step {len(u) - 1}   u = {u[-1]:.5g}   F = {F[-1]:.5g}   "
+        # No elapsed time here any more -- the clock has its own slot, which
+        # is updated once a SECOND rather than being rewritten as a side
+        # effect of every plot refresh.
+        self.readout.set(
+            f"u = {u[-1]:.5g}   F = {F[-1]:.5g}   "
             f"peak |F| = {peak:.5g}   max phi = {phi[-1]:.3f}"
             + (f"   [{len(bad)} non-converged]" if bad else ""))
 
